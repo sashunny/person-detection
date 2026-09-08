@@ -70,6 +70,14 @@ while True:
 
     for person_box in person_results.boxes:
         px1, py1, px2, py2 = map(int, person_box.xyxy[0].tolist())
+        person_conf = float(person_box.conf[0])
+
+        # --- Always draw the person box, so you can see detection coverage ---
+        cv2.rectangle(frame, (px1, py1), (px2, py2), (255, 150, 0), 2)
+        cv2.putText(
+            frame, f"Person {person_conf:.2f}", (px1, max(py1 - 8, 0)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 150, 0), 2,
+        )
 
         # --- crop lower body region (legs/feet), expanded by offsets ---
         person_height = py2 - py1
