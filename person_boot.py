@@ -23,6 +23,7 @@ BOOT_MODEL_PATH = "/path/to/your/best.pt"     # your trained boot_detector weigh
 
 PERSON_CLASS_ID = 0                           # COCO 'person'
 BOOT_CLASS_ID = 0                             # 0 = Boot in your boot model (per earlier training script)
+NO_BOOT_CLASS_ID = 1                          # 1 = No_Boot in your boot model
 
 PERSON_CONF = 0.4
 BOOT_CONF = 0.4
@@ -101,21 +102,30 @@ while True:
             verbose=False,
         )[0]
 
-        # Check if a Boot (compliant) was detected in this crop
+        # Check for Boot (compliant) and No_Boot (non-compliant) detections in this crop
         wearing_boot = False
         boot_conf_value = 0.0
         boot_box_in_crop = None
+
+        no_boot_detected = False
+        no_boot_conf_value = 0.0
+        no_boot_box_in_crop = None
 
         for boot_box in boot_results.boxes:
             cls_id = int(boot_box.cls[0])
             conf = float(boot_box.conf[0])
             if cls_id == BOOT_CLASS_ID:
-                wearing_boot = True
                 if conf > boot_conf_value:
+                    wearing_boot = True
                     boot_conf_value = conf
                     boot_box_in_crop = boot_box.xyxy[0].tolist()
+            elif cls_id == NO_BOOT_CLASS_ID:
+                if conf > no_boot_conf_value:
+                    no_boot_detected = True
+                    no_boot_conf_value = conf
+                    no_boot_box_in_crop = boot_box.xyxy[0].tolist()
 
-        # --- Draw box ONLY if wearing a safety boot ---
+        # --- Draw box for safety boot (green) ---
         if wearing_boot and boot_box_in_crop is not None:
             bx1, by1, bx2, by2 = boot_box_in_crop
             # map crop-local coords back to full-frame coords
@@ -131,6 +141,21 @@ while True:
             cv2.putText(
                 frame, label, (abs_x1, max(abs_y1 - 8, 0)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2,
+            )
+
+        # --- Draw box for no boot (red) — helps debug misses/violations ---
+        if no_boot_detected and no_boot_box_in_crop is not None:
+            nx1, ny1, nx2, ny2 = no_boot_box_in_crop
+            abs_x1 = crop_x1 + int(nx1)
+            abs_y1 = crop_y1 + int(ny1)
+            abs_x2 = crop_x1 + int(nx2)
+            abs_y2 = crop_y1 + int(ny2)
+
+            label = f"No Boot {no_boot_conf_value:.2f}"
+            cv2.rectangle(frame, (abs_x1, abs_y1), (abs_x2, abs_y2), (0, 0, 255), 2)
+            cv2.putText(
+                frame, label, (abs_x1, max(abs_y1 - 8, 0)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
             )
 
     writer.write(frame)
