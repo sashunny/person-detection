@@ -145,43 +145,34 @@ while True:
         )
 
         for (roi_x1, roi_y1), boot_results in zip(roi_coords, batched_boot_results):
-            wearing_boot = False
-            boot_conf_value = 0.0
-            boot_box_in_roi = None
-
-            no_boot_detected = False
-            no_boot_conf_value = 0.0
-            no_boot_box_in_roi = None
+            # Collect ALL boxes above threshold, not just the single best one —
+            # a person has two feet, so we want both boots drawn if both are found.
+            boot_boxes = []
+            no_boot_boxes = []
 
             for box in boot_results.boxes:
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
-                if cls_id == BOOT_CLASS_ID and conf > boot_conf_value:
-                    wearing_boot = True
-                    boot_conf_value = conf
-                    boot_box_in_roi = box.xyxy[0].tolist()
-                elif cls_id == NO_BOOT_CLASS_ID and conf > no_boot_conf_value:
-                    no_boot_detected = True
-                    no_boot_conf_value = conf
-                    no_boot_box_in_roi = box.xyxy[0].tolist()
+                if cls_id == BOOT_CLASS_ID:
+                    boot_boxes.append((conf, box.xyxy[0].tolist()))
+                elif cls_id == NO_BOOT_CLASS_ID:
+                    no_boot_boxes.append((conf, box.xyxy[0].tolist()))
 
-            if wearing_boot and boot_box_in_roi is not None:
-                bx1, by1, bx2, by2 = boot_box_in_roi
+            for conf, (bx1, by1, bx2, by2) in boot_boxes:
                 abs_x1, abs_y1 = roi_x1 + int(bx1), roi_y1 + int(by1)
                 abs_x2, abs_y2 = roi_x1 + int(bx2), roi_y1 + int(by2)
                 cv2.rectangle(frame, (abs_x1, abs_y1), (abs_x2, abs_y2), (0, 200, 0), 2)
                 cv2.putText(
-                    frame, f"Safety Boot {boot_conf_value:.2f}", (abs_x1, max(abs_y1 - 8, 0)),
+                    frame, f"Safety Boot {conf:.2f}", (abs_x1, max(abs_y1 - 8, 0)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2,
                 )
 
-            if no_boot_detected and no_boot_box_in_roi is not None:
-                nx1, ny1, nx2, ny2 = no_boot_box_in_roi
+            for conf, (nx1, ny1, nx2, ny2) in no_boot_boxes:
                 abs_x1, abs_y1 = roi_x1 + int(nx1), roi_y1 + int(ny1)
                 abs_x2, abs_y2 = roi_x1 + int(nx2), roi_y1 + int(ny2)
                 cv2.rectangle(frame, (abs_x1, abs_y1), (abs_x2, abs_y2), (0, 0, 255), 2)
                 cv2.putText(
-                    frame, f"No Boot {no_boot_conf_value:.2f}", (abs_x1, max(abs_y1 - 8, 0)),
+                    frame, f"No Boot {conf:.2f}", (abs_x1, max(abs_y1 - 8, 0)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
                 )
 
