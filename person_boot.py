@@ -31,6 +31,9 @@ NO_BOOT_CLASS_ID = 1                          # 1 = No_Boot
 
 POSE_CONF = 0.4
 BOOT_CONF = 0.4
+POSE_IMGSZ = 480                              # lower than the default 640 — pose/keypoint localization
+                                               # tolerates lower resolution better than small-object
+                                               # detection does, and this is a real CPU speedup with no GPU
 KEYPOINT_CONF_THRESHOLD = 0.3                 # ignore ankle keypoints below this confidence
 
 LEFT_ANKLE_IDX = 15
@@ -49,6 +52,9 @@ DISPLAY_LIVE = True
 
 pose_model = YOLO(POSE_MODEL_PATH)
 boot_model = YOLO(BOOT_MODEL_PATH)
+
+pose_model.fuse()  # fuses Conv+BatchNorm layers — small free speedup, no accuracy cost
+boot_model.fuse()
 
 cap = cv2.VideoCapture(VIDEO_SOURCE)
 if not cap.isOpened():
@@ -72,6 +78,7 @@ while True:
     pose_results = pose_model.predict(
         source=frame,
         conf=POSE_CONF,
+        imgsz=POSE_IMGSZ,
         verbose=False,
     )[0]
 
@@ -85,6 +92,12 @@ while True:
 
     kpts_xy = pose_results.keypoints.xy.cpu().numpy()      # (num_people, 17, 2)
     kpts_conf = pose_results.keypoints.conf.cpu().numpy()  # (num_people, 17)
+
+    # --- Pass 1: for every person, build the ankle-based ROI and collect it.
+    # We don't run the boot model yet — we batch all ROIs into one call below,
+    # which is much faster than calling predict() once per person.
+    roi_crops = []
+    roi_coords = []  # (roi_x1, roi_y1) origin for each crop, aligned by index with roi_crops
 
     for person_idx in range(len(kpts_xy)):
         person_kpts = kpts_xy[person_idx]
@@ -118,51 +131,59 @@ while True:
         # visualize the ROI box itself (light gray), useful for debugging
         cv2.rectangle(frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (180, 180, 180), 1)
 
-        boot_results = boot_model.predict(
-            source=roi,
+        roi_crops.append(roi)
+        roi_coords.append((roi_x1, roi_y1))
+
+    # --- Pass 2: run the boot model ONCE on all collected ROIs (batched),
+    # instead of once per person. This is the main speedup — a single
+    # predict() call on a list of crops has far less overhead than N calls.
+    if roi_crops:
+        batched_boot_results = boot_model.predict(
+            source=roi_crops,
             conf=BOOT_CONF,
             verbose=False,
-        )[0]
+        )
 
-        wearing_boot = False
-        boot_conf_value = 0.0
-        boot_box_in_roi = None
+        for (roi_x1, roi_y1), boot_results in zip(roi_coords, batched_boot_results):
+            wearing_boot = False
+            boot_conf_value = 0.0
+            boot_box_in_roi = None
 
-        no_boot_detected = False
-        no_boot_conf_value = 0.0
-        no_boot_box_in_roi = None
+            no_boot_detected = False
+            no_boot_conf_value = 0.0
+            no_boot_box_in_roi = None
 
-        for box in boot_results.boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            if cls_id == BOOT_CLASS_ID and conf > boot_conf_value:
-                wearing_boot = True
-                boot_conf_value = conf
-                boot_box_in_roi = box.xyxy[0].tolist()
-            elif cls_id == NO_BOOT_CLASS_ID and conf > no_boot_conf_value:
-                no_boot_detected = True
-                no_boot_conf_value = conf
-                no_boot_box_in_roi = box.xyxy[0].tolist()
+            for box in boot_results.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                if cls_id == BOOT_CLASS_ID and conf > boot_conf_value:
+                    wearing_boot = True
+                    boot_conf_value = conf
+                    boot_box_in_roi = box.xyxy[0].tolist()
+                elif cls_id == NO_BOOT_CLASS_ID and conf > no_boot_conf_value:
+                    no_boot_detected = True
+                    no_boot_conf_value = conf
+                    no_boot_box_in_roi = box.xyxy[0].tolist()
 
-        if wearing_boot and boot_box_in_roi is not None:
-            bx1, by1, bx2, by2 = boot_box_in_roi
-            abs_x1, abs_y1 = roi_x1 + int(bx1), roi_y1 + int(by1)
-            abs_x2, abs_y2 = roi_x1 + int(bx2), roi_y1 + int(by2)
-            cv2.rectangle(frame, (abs_x1, abs_y1), (abs_x2, abs_y2), (0, 200, 0), 2)
-            cv2.putText(
-                frame, f"Safety Boot {boot_conf_value:.2f}", (abs_x1, max(abs_y1 - 8, 0)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2,
-            )
+            if wearing_boot and boot_box_in_roi is not None:
+                bx1, by1, bx2, by2 = boot_box_in_roi
+                abs_x1, abs_y1 = roi_x1 + int(bx1), roi_y1 + int(by1)
+                abs_x2, abs_y2 = roi_x1 + int(bx2), roi_y1 + int(by2)
+                cv2.rectangle(frame, (abs_x1, abs_y1), (abs_x2, abs_y2), (0, 200, 0), 2)
+                cv2.putText(
+                    frame, f"Safety Boot {boot_conf_value:.2f}", (abs_x1, max(abs_y1 - 8, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2,
+                )
 
-        if no_boot_detected and no_boot_box_in_roi is not None:
-            nx1, ny1, nx2, ny2 = no_boot_box_in_roi
-            abs_x1, abs_y1 = roi_x1 + int(nx1), roi_y1 + int(ny1)
-            abs_x2, abs_y2 = roi_x1 + int(nx2), roi_y1 + int(ny2)
-            cv2.rectangle(frame, (abs_x1, abs_y1), (abs_x2, abs_y2), (0, 0, 255), 2)
-            cv2.putText(
-                frame, f"No Boot {no_boot_conf_value:.2f}", (abs_x1, max(abs_y1 - 8, 0)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
-            )
+            if no_boot_detected and no_boot_box_in_roi is not None:
+                nx1, ny1, nx2, ny2 = no_boot_box_in_roi
+                abs_x1, abs_y1 = roi_x1 + int(nx1), roi_y1 + int(ny1)
+                abs_x2, abs_y2 = roi_x1 + int(nx2), roi_y1 + int(ny2)
+                cv2.rectangle(frame, (abs_x1, abs_y1), (abs_x2, abs_y2), (0, 0, 255), 2)
+                cv2.putText(
+                    frame, f"No Boot {no_boot_conf_value:.2f}", (abs_x1, max(abs_y1 - 8, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
+                )
 
     writer.write(frame)
 
