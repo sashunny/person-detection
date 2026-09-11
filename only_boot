@@ -1,0 +1,103 @@
+"""
+Run ONLY the boot detector (no pose/person model) on a video — full-frame
+detection of Boot / No_Boot. Displays the video in a resizable window and
+saves the annotated output.
+
+Just edit the CONFIG section below and run:
+    pip install ultralytics opencv-python --break-system-packages
+    python detect_boots_only.py
+
+Press 'q' while the display window is focused to stop early (output
+saved up to that point either way).
+"""
+
+import cv2
+from ultralytics import YOLO
+
+# ----------------- CONFIG (edit these) -----------------
+VIDEO_SOURCE = "/path/to/input_video.mp4"     # or an RTSP URL
+OUTPUT_VIDEO_PATH = "/path/to/output_video.mp4"
+
+BOOT_MODEL_PATH = "/path/to/your/best.pt"     # your trained boot_detector weights
+
+BOOT_CLASS_ID = 0                             # 0 = Boot
+NO_BOOT_CLASS_ID = 1                          # 1 = No_Boot
+
+BOOT_CONF = 0.4
+
+DISPLAY_WINDOW_WIDTH = 960                    # resized display window size (doesn't affect saved video resolution)
+DISPLAY_WINDOW_HEIGHT = 540
+
+DISPLAY_LIVE = True
+# ---------------------------------------------------------
+
+boot_model = YOLO(BOOT_MODEL_PATH)
+
+cap = cv2.VideoCapture(VIDEO_SOURCE)
+if not cap.isOpened():
+    raise RuntimeError(f"Could not open video source: {VIDEO_SOURCE}")
+
+fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+writer = cv2.VideoWriter(OUTPUT_VIDEO_PATH, fourcc, fps, (frame_w, frame_h))
+
+if DISPLAY_LIVE:
+    window_name = "Boot Detection"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)  # WINDOW_NORMAL allows resizing
+    cv2.resizeWindow(window_name, DISPLAY_WINDOW_WIDTH, DISPLAY_WINDOW_HEIGHT)
+
+frame_count = 0
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    frame_count += 1
+
+    boot_results = boot_model.predict(
+        source=frame,
+        conf=BOOT_CONF,
+        verbose=False,
+    )[0]
+
+    for box in boot_results.boxes:
+        cls_id = int(box.cls[0])
+        conf = float(box.conf[0])
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
+        if cls_id == BOOT_CLASS_ID:
+            color = (0, 200, 0)      # green
+            label = f"Boot {conf:.2f}"
+        elif cls_id == NO_BOOT_CLASS_ID:
+            color = (0, 0, 255)      # red
+            label = f"No Boot {conf:.2f}"
+        else:
+            continue  # unknown class, skip
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            frame, label, (x1, max(y1 - 8, 0)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
+        )
+
+    writer.write(frame)
+
+    if DISPLAY_LIVE:
+        cv2.imshow(window_name, frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            print("Stopped early by user.")
+            break
+
+    if frame_count % 50 == 0:
+        print(f"Processed {frame_count} frames...")
+
+cap.release()
+writer.release()
+if DISPLAY_LIVE:
+    cv2.destroyAllWindows()
+
+print(f"\nDone. {frame_count} frames processed.")
+print(f"Output video saved to: {OUTPUT_VIDEO_PATH}")
