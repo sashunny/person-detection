@@ -186,6 +186,12 @@ optimizer = torch.optim.AdamW(
 )
 
 # %% 8. Train
+# Warmup given as an integer step count: newer transformers versions removed warmup_ratio.
+import math
+steps_per_epoch = math.ceil(len(train_ds) / (BATCH_SIZE * GRAD_ACC))
+WARMUP_STEPS = max(1, int(0.05 * steps_per_epoch * EPOCHS))
+print(f"steps/epoch={steps_per_epoch}, total steps={steps_per_epoch * EPOCHS}, warmup={WARMUP_STEPS}")
+
 args = TrainingArguments(
     output_dir=OUTPUT_DIR,
     num_train_epochs=EPOCHS,
@@ -195,7 +201,7 @@ args = TrainingArguments(
     learning_rate=LR_HEAD,              # used only for scheduler bookkeeping
     weight_decay=WEIGHT_DECAY,
     lr_scheduler_type="cosine",
-    warmup_ratio=0.05,
+    warmup_steps=WARMUP_STEPS,
     max_grad_norm=0.1,                  # RT-DETR default gradient clipping
     fp16=torch.cuda.is_available(),
     eval_strategy="epoch",
