@@ -48,34 +48,44 @@ def setup():
 
 # ----------------------------------------------------------------------------
 # 2. Find the train/val image folders inside /kaggle/input
-#    Expects CVAT YOLO export structure: images/<subset>/ and labels/<subset>/
+#    Supports both layouts:
+#      A) images/<split>/  + labels/<split>/   (CVAT project export)
+#      B) <split>/images/  + <split>/labels/   (Roboflow-style)
+#    Returns (image_dir, label_dir) for train and val.
 # ----------------------------------------------------------------------------
 def find_split_dirs():
-    train_dir = val_dir = None
+    train = val = None
     for d in INPUT_ROOT.rglob("*"):
-        if d.is_dir() and d.parent.name == "images":
-            name = d.name.lower()
-            if name in TRAIN_NAMES:
-                train_dir = d
-            elif name in VAL_NAMES:
-                val_dir = d
-    if train_dir is None or val_dir is None:
+        if not d.is_dir():
+            continue
+        if d.parent.name == "images":                      # layout A
+            split, lbl = d.name.lower(), d.parent.parent / "labels" / d.name
+        elif d.name == "images":                           # layout B
+            split, lbl = d.parent.name.lower(), d.parent / "labels"
+        else:
+            continue
+        if split in TRAIN_NAMES:
+            train = (d, lbl)
+        elif split in VAL_NAMES:
+            val = (d, lbl)
+    if train is None or val is None:
         found = sorted(str(d) for d in INPUT_ROOT.rglob("images") if d.is_dir())
         sys.exit(
-            "Could not find both images/train and images/validation folders.\n"
+            "Could not find both a train and a validation image folder.\n"
             f"'images' folders found: {found}\n"
-            "If train and val ended up in the same folder after merging, "
-            "re-export so each project goes into its own subset folder."
+            f"Split folders must be named one of {sorted(TRAIN_NAMES)} / {sorted(VAL_NAMES)}."
         )
-    print(f"Train images: {train_dir}\nVal images:   {val_dir}")
-    return train_dir, val_dir
+    for split, (img, lbl) in (("Train", train), ("Val", val)):
+        print(f"{split} images: {img}\n{split} labels: {lbl}"
+              + ("" if lbl.is_dir() else "   <-- NOT FOUND, all frames will be treated as background!"))
+    return train, val
 
 
 # ----------------------------------------------------------------------------
 # 3. Copy into a clean, writable structure and sanity-check labels
 # ----------------------------------------------------------------------------
-def copy_split(src_img_dir, split):
-    src_lbl_dir = src_img_dir.parent.parent / "labels" / src_img_dir.name
+def copy_split(src_dirs, split):
+    src_img_dir, src_lbl_dir = src_dirs
     dst_img = DATA_DIR / "images" / split
     dst_lbl = DATA_DIR / "labels" / split
     dst_img.mkdir(parents=True, exist_ok=True)
