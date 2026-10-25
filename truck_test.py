@@ -13,6 +13,10 @@ Options:
     --conf   confidence threshold (default 0.4)
     --imgsz  inference size; keep it the same as training (default 640)
     --skip   run the model every N frames and reuse boxes in between (speeds up CPU)
+    --no-show  don't open the live preview window (just save the video)
+
+Live preview keys:  q / Esc = stop (video saved up to that point),  space = pause/resume
+Note: the preview needs "opencv-python", not "opencv-python-headless".
 """
 
 import argparse
@@ -34,6 +38,7 @@ def parse_args():
     p.add_argument("--conf", type=float, default=0.4, help="confidence threshold")
     p.add_argument("--imgsz", type=int, default=640, help="inference image size")
     p.add_argument("--skip", type=int, default=1, help="run model every N frames")
+    p.add_argument("--no-show", action="store_true", help="don't show the live preview window")
     return p.parse_args()
 
 
@@ -79,6 +84,16 @@ def main():
     print(f"Input: {video}  ({int(cap.get(3))}x{int(cap.get(4))} @ {fps:.1f} fps, "
           f"{total or '?'} frames)\nOutput: {out_path}  ({OUT_W}x{OUT_H})")
 
+    show = not args.no_show
+    win = "Truck detection (q = quit, space = pause)"
+    if show:
+        try:
+            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win, OUT_W, OUT_H)
+        except cv2.error:
+            print("No display available (opencv-python-headless?). Saving without preview.")
+            show = False
+
     boxes, i, start = [], 0, time.time()
     while True:
         ok, frame = cap.read()
@@ -95,6 +110,19 @@ def main():
         writer.write(frame)
         i += 1
 
+        if show:
+            cv2.imshow(win, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord(" "):                       # pause until space again
+                while (key := cv2.waitKey(0) & 0xFF) not in (ord(" "), ord("q"), 27):
+                    pass
+            if key in (ord("q"), 27):                 # q or Esc
+                print("Stopped by user.")
+                break
+            if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:   # window closed
+                print("Preview window closed.")
+                break
+
         if i % 50 == 0:
             speed = i / (time.time() - start)
             left = f", ~{(total - i) / speed / 60:.1f} min left" if total else ""
@@ -102,6 +130,8 @@ def main():
 
     cap.release()
     writer.release()
+    if show:
+        cv2.destroyAllWindows()
     print(f"Done: {i} frames in {(time.time() - start) / 60:.1f} min -> {out_path}")
 
 
