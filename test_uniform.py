@@ -1,7 +1,12 @@
 """
-Local CPU test: YOLO26n person detection -> uniform / no-uniform classifier on each crop.
+Local CPU test: YOLO26n person detection -> 3-class crop classifier
+                (uniform / no_uniform / not_a_person)
 
 Draws boxes + labels, shows the video in a resizable window, and saves the annotated output.
+  green  = uniform
+  red    = no uniform
+  yellow = uncertain (top probability below --min-conf)
+  gray   = not a person / too small   (hidden unless --show-bg)
 
 Install (once):
     pip install ultralytics opencv-python pillow torch torchvision onnxruntime
@@ -9,7 +14,7 @@ Install (once):
 Usage:
     python test_uniform_video.py --video test.mp4
     python test_uniform_video.py --video test.mp4 --cls uniform_classifier.onnx --meta uniform_classifier_meta.json
-    python test_uniform_video.py --video test.mp4 --window-width 1600 --out result.mp4
+    python test_uniform_video.py --video test.mp4 --show-bg --min-conf 0.6 --window-width 1600
 
 Keys while playing:  q / Esc = quit,  space = pause/resume
 The window can also be resized freely with the mouse.
@@ -25,9 +30,15 @@ import numpy as np
 from PIL import Image
 from ultralytics import YOLO
 
-GREEN = (0, 200, 0)      # uniform        (BGR)
-RED = (0, 0, 230)        # no_uniform
-GRAY = (160, 160, 160)   # too small to classify
+COLORS = {                       # BGR
+    "uniform": (0, 200, 0),
+    "no_uniform": (0, 0, 230),
+    "uncertain": (0, 200, 230),
+    "not_a_person": (150, 150, 150),
+    "small": (150, 150, 150),
+}
+DISPLAY = {"uniform": "uniform", "no_uniform": "no uniform",
+           "not_a_person": "not person", "uncertain": "uncertain"}
 
 
 # ------------------------- preprocessing (must match training) -------------------------
@@ -48,8 +59,7 @@ def preprocess(pil_crops, meta):
     batch = []
     for c in pil_crops:
         a = np.asarray(letterbox_pil(c, meta["img_size"], meta["pad_color"]), dtype=np.float32) / 255.0
-        a = (a - mean) / std
-        batch.append(a.transpose(2, 0, 1))
+        batch.append(((a - mean) / std).transpose(2, 0, 1))
     return np.stack(batch).astype(np.float32)
 
 
@@ -62,8 +72,8 @@ def softmax(x):
 class TorchClassifier:
     def __init__(self, ckpt_path, threads=None):
         import torch
-        from torchvision import models
         import torch.nn as nn
+        from torchvision import models
 
         if threads:
             torch.set_num_threads(threads)
@@ -85,8 +95,7 @@ class TorchClassifier:
     def __call__(self, pil_crops):
         x = self.torch.from_numpy(preprocess(pil_crops, self.meta))
         with self.torch.inference_mode():
-            logits = self.model(x).numpy()
-        return softmax(logits)[:, 1]  # P(uniform)
+            return softmax(self.model(x).numpy())     # (N, n_classes)
 
 
 class OnnxClassifier:
@@ -102,8 +111,7 @@ class OnnxClassifier:
         self.inp = self.sess.get_inputs()[0].name
 
     def __call__(self, pil_crops):
-        logits = self.sess.run(None, {self.inp: preprocess(pil_crops, self.meta)})[0]
-        return softmax(logits)[:, 1]
+        return softmax(self.sess.run(None, {self.inp: preprocess(pil_crops, self.meta)})[0])
 
 
 # ------------------------------------ drawing ------------------------------------
@@ -113,12 +121,12 @@ def draw_label(img, x1, y1, text, color):
     (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
     y_top = max(0, y1 - th - base - 4)
     cv2.rectangle(img, (x1, y_top), (x1 + tw + 6, y_top + th + base + 4), color, -1)
+    txt_color = (0, 0, 0) if color == COLORS["uncertain"] else (255, 255, 255)
     cv2.putText(img, text, (x1 + 3, y_top + th + 2), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, (255, 255, 255), thick, cv2.LINE_AA)
+                scale, txt_color, thick, cv2.LINE_AA)
 
 
-def draw_hud(img, fps, n_uni, n_no):
-    lines = [f"FPS: {fps:.1f}", f"Uniform: {n_uni}", f"No uniform: {n_no}"]
+def draw_hud(img, lines):
     scale = max(0.6, min(img.shape[:2]) / 900)
     thick = max(1, round(scale * 2))
     y = int(30 * scale)
@@ -130,7 +138,7 @@ def draw_hud(img, fps, n_uni, n_no):
 
 # -------------------------------------- main --------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Uniform detection test on a video (CPU)")
+    ap = argparse.ArgumentParser(description="Uniform detection test on a video (CPU, 3-class)")
     ap.add_argument("--video", required=True, help="input video path")
     ap.add_argument("--det", default="yolo26n.pt", help="YOLO person detector weights")
     ap.add_argument("--cls", default="uniform_classifier.pt", help="classifier .pt or .onnx")
@@ -140,7 +148,9 @@ def main():
     ap.add_argument("--imgsz", type=int, default=640, help="detector input size")
     ap.add_argument("--pad", type=float, default=0.10, help="crop padding per side (same as training)")
     ap.add_argument("--min-h", type=int, default=60, help="skip classifying persons shorter than this (px)")
-    ap.add_argument("--threshold", type=float, default=None, help="override tuned threshold from meta")
+    ap.add_argument("--min-conf", type=float, default=0.0,
+                    help="mark uniform/no-uniform as 'uncertain' if top probability is below this (e.g. 0.6)")
+    ap.add_argument("--show-bg", action="store_true", help="also draw not-a-person and too-small boxes in gray")
     ap.add_argument("--window-width", type=int, default=1280, help="initial display window width")
     ap.add_argument("--threads", type=int, default=None, help="CPU threads for the classifier")
     ap.add_argument("--no-show", action="store_true", help="don't display, only save")
@@ -152,8 +162,11 @@ def main():
         classifier = OnnxClassifier(args.cls, args.meta, args.threads)
     else:
         classifier = TorchClassifier(args.cls, args.threads)
-    thr = args.threshold if args.threshold is not None else classifier.meta.get("threshold", 0.5)
-    print(f"Classifier threshold: {thr:.2f}")
+    classes = classifier.meta["classes"]
+    print("Classifier classes:", classes)
+    for needed in ("uniform", "no_uniform", "not_a_person"):
+        if needed not in classes:
+            raise SystemExit(f"Classifier has no '{needed}' class — is this the 3-class model?")
 
     # --- video io ---
     cap = cv2.VideoCapture(args.video)
@@ -168,11 +181,12 @@ def main():
 
     win = "Uniform detection"
     if not args.no_show:
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)          # resizable window
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)              # resizable window
         disp_w = min(args.window_width, W)
         cv2.resizeWindow(win, disp_w, int(H * disp_w / W))  # keep aspect ratio
 
     frame_idx, fps_avg, paused = 0, 0.0, False
+    frame = None
     while True:
         if not paused:
             ok, frame = cap.read()
@@ -181,12 +195,12 @@ def main():
             frame_idx += 1
             t0 = time.time()
 
-            # 1) detect persons (class 0) — boxes come back in original frame coords
+            # 1) detect persons (class 0) — boxes are in original frame coordinates
             res = detector.predict(frame, classes=[0], conf=args.conf, imgsz=args.imgsz,
                                    device="cpu", verbose=False)[0]
             boxes = res.boxes.xyxy.cpu().numpy().astype(int) if res.boxes is not None else []
 
-            # 2) crop with padding (from the full-res frame), BGR -> RGB
+            # 2) crop with padding from the full-res frame, BGR -> RGB
             crops, keep, small = [], [], []
             for (x1, y1, x2, y2) in boxes:
                 bw, bh = x2 - x1, y2 - y1
@@ -203,24 +217,36 @@ def main():
                 keep.append((x1, y1, x2, y2))
 
             # 3) classify all crops of this frame in one batch
-            probs = classifier(crops) if crops else []
+            probs = classifier(crops) if crops else np.zeros((0, len(classes)))
 
-            # 4) draw
-            n_uni = n_no = 0
+            # 4) decide + draw
+            counts = {"uniform": 0, "no_uniform": 0, "uncertain": 0, "not_a_person": 0}
             for (x1, y1, x2, y2), p in zip(keep, probs):
-                is_uni = p >= thr
-                color = GREEN if is_uni else RED
-                label = f"uniform {p:.2f}" if is_uni else f"no uniform {1 - p:.2f}"
-                n_uni += int(is_uni)
-                n_no += int(not is_uni)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                draw_label(frame, x1, y1, label, color)
-            for (x1, y1, x2, y2) in small:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), GRAY, 1)
+                k = int(p.argmax())
+                cls, conf = classes[k], float(p[k])
+                if cls != "not_a_person" and conf < args.min_conf:
+                    cls = "uncertain"
+                counts[cls] += 1
+
+                if cls == "not_a_person" and not args.show_bg:
+                    continue
+                color = COLORS[cls]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1 if cls == "not_a_person" else 2)
+                draw_label(frame, x1, y1, f"{DISPLAY[cls]} {conf:.2f}", color)
+
+            if args.show_bg:
+                for (x1, y1, x2, y2) in small:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), COLORS["small"], 1)
 
             dt = time.time() - t0
             fps_avg = 0.9 * fps_avg + 0.1 * (1 / dt) if fps_avg else 1 / dt
-            draw_hud(frame, fps_avg, n_uni, n_no)
+            hud = [f"FPS: {fps_avg:.1f}",
+                   f"Uniform: {counts['uniform']}",
+                   f"No uniform: {counts['no_uniform']}"]
+            if args.min_conf > 0:
+                hud.append(f"Uncertain: {counts['uncertain']}")
+            hud.append(f"Filtered (not person): {counts['not_a_person']}")
+            draw_hud(frame, hud)
             writer.write(frame)
 
             if frame_idx % 50 == 0:
@@ -233,8 +259,7 @@ def main():
                 break
             if key == ord(" "):
                 paused = not paused
-            # stop if the user closed the window
-            if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+            if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:   # window closed
                 break
 
     cap.release()
