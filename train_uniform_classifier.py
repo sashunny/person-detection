@@ -1,27 +1,29 @@
 """
-Uniform vs No-Uniform person-crop classifier  (Kaggle-ready)
-===========================================================
+3-class person-crop classifier:  uniform / no_uniform / not_a_person   (Kaggle-ready)
+===================================================================================
 
-Expected data layout (any nesting under DATA_ROOT is fine; folders are found automatically):
-    DATA_ROOT/
-        uniform/       *.jpg / *.png ...
-        no uniform/    *.jpg / *.png ...   ("no_uniform" / "no-uniform" also work)
+Data on Kaggle
+  Zip your three folders and upload the zip as a Kaggle dataset ("Create Dataset").
+  Kaggle extracts it automatically. Any nesting is fine — the folders are found by name:
+      uniform/         no_uniform/  (or "no uniform")      not_a_person/  (or "not a person")
 
 What it does
-  1. Collects images, then splits train/val (default 80/20), stratified by class.
-     Near-duplicate crops (consecutive frames) are grouped so they never land on
-     both sides of the split -> honest validation numbers.
-     If your filenames contain the location/video name, set GROUP_REGEX to split
-     by location instead (even better).
-  2. Letterboxes every crop to 224x224 (keeps body proportions, gray padding).
+  1. Collects images and splits train/val (default 80/20), stratified by class.
+     Near-duplicate crops (consecutive frames) are grouped so they never land on both
+     sides of the split -> honest validation numbers. If filenames contain the
+     location/video name, set GROUP_REGEX to split by location instead (even better).
+  2. Letterboxes every crop to 224x224 (keeps proportions, gray padding).
   3. Fine-tunes ImageNet-pretrained EfficientNet-B0 (or MobileNetV3-Large):
      a few epochs with the backbone frozen, then full fine-tuning.
-  4. Keeps the best epoch, tunes the decision threshold on val, and saves:
-        /kaggle/working/uniform_classifier.pt        (weights + preprocessing meta)
+     Class weights compensate for the smaller not_a_person class.
+  4. Keeps the epoch with the best val balanced accuracy (mean per-class recall) and saves:
+        /kaggle/working/uniform_classifier.pt         (weights + preprocessing meta)
         /kaggle/working/uniform_classifier_meta.json
-        /kaggle/working/uniform_classifier.onnx      (if export succeeds)
-        /kaggle/working/split.csv                    (which file went where)
-        /kaggle/working/val_mistakes.csv             (misclassified val crops)
+        /kaggle/working/uniform_classifier.onnx       (if export succeeds)
+        /kaggle/working/split.csv                     (which file went where)
+        /kaggle/working/val_mistakes.csv              (misclassified val crops + probabilities)
+
+Decision rule at inference: argmax over the 3 softmax probabilities.
 
 Kaggle notes
   * Turn on a GPU (Settings -> Accelerator -> GPU T4/P100).
@@ -40,26 +42,30 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from PIL import Image
-from sklearn.metrics import (balanced_accuracy_score, confusion_matrix,
-                             f1_score, roc_auc_score)
+from sklearn.metrics import (balanced_accuracy_score, classification_report,
+                             confusion_matrix, f1_score)
 from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
 
 # ============================== CONFIG ==============================
-DATA_ROOT = "/kaggle/input"          # point to your dataset, e.g. "/kaggle/input/uniform-crops"
+DATA_ROOT = "/kaggle/input"          # e.g. "/kaggle/input/uniform-crops"
 OUT_DIR = "/kaggle/working"
 
 MODEL_NAME = "efficientnet_b0"       # or "mobilenet_v3_large" (faster, slightly less accurate)
 IMG_SIZE = 224
 PAD_COLOR = (114, 114, 114)          # letterbox padding color — use the SAME at inference
 
+# Class order defines the output indices. Folder names are matched ignoring case,
+# spaces, underscores and hyphens ("not a person" == "not_a_person").
+CLASSES = ["no_uniform", "uniform", "not_a_person"]
+
 VAL_FRACTION = 0.2
 SEED = 42
 
 # Split grouping (prevents near-identical crops leaking between train and val)
 GROUP_REGEX = None                   # e.g. r"^(loc\d+)_" if files look like "loc07_frame123_p2.jpg"
-VAL_GROUPS = []                      # optional: exact groups (from GROUP_REGEX) to force into val, e.g. ["loc03","loc11"]
+VAL_GROUPS = []                      # optional: groups (from GROUP_REGEX) to force into val, e.g. ["loc03","loc11"]
 DEDUP_GROUPING = True                # used when GROUP_REGEX is None
 DEDUP_MAX_BITS = 10                  # dHash Hamming distance (0-64) to call two crops near-duplicates
 
@@ -73,9 +79,10 @@ LABEL_SMOOTHING = 0.05
 PATIENCE = 6                         # early stopping on val balanced accuracy
 NUM_WORKERS = 2
 
-CLASSES = ["no_uniform", "uniform"]  # index 1 = uniform (positive class)
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 # ====================================================================
+
+N_CLS = len(CLASSES)
 
 
 def seed_everything(seed):
@@ -90,9 +97,11 @@ def norm_name(s):
 
 
 def find_class_dir(root, wanted):
-    """Find a folder whose normalized name matches (e.g. 'no uniform' == 'no_uniform')."""
+    """Find a folder whose normalized name matches (skips macOS zip junk)."""
     target = norm_name(wanted)
     for dirpath, dirnames, _ in os.walk(root):
+        if "__MACOSX" in dirpath:
+            continue
         for d in dirnames:
             if norm_name(d) == target:
                 return Path(dirpath) / d
@@ -103,11 +112,12 @@ def collect_images():
     rows = []
     for label, cls in enumerate(CLASSES):
         cdir = find_class_dir(DATA_ROOT, cls)
-        files = sorted(p for p in cdir.rglob("*") if p.suffix.lower() in IMG_EXTS)
-        print(f"{cls:>11}: {len(files):6d} images  ({cdir})")
+        files = sorted(p for p in cdir.rglob("*")
+                       if p.suffix.lower() in IMG_EXTS and not p.name.startswith("._"))
+        print(f"{cls:>13}: {len(files):6d} images  ({cdir})")
+        if not files:
+            raise RuntimeError(f"No images in {cdir}")
         rows += [{"path": str(p), "label": label} for p in files]
-    if not rows:
-        raise RuntimeError("No images found.")
     return pd.DataFrame(rows)
 
 
@@ -155,7 +165,9 @@ def make_split(df):
     elif DEDUP_GROUPING:
         print("Grouping near-duplicate crops (dHash)...")
         groups = dedup_groups(df)
-        print(f"{len(df)} images -> {len(set(groups))} near-duplicate groups")
+        for label, cls in enumerate(CLASSES):
+            g = groups[df["label"].values == label]
+            print(f"  {cls:>13}: {len(g)} images -> {len(set(g))} unique groups")
     else:
         groups = np.arange(len(df)).astype(str)
 
@@ -178,9 +190,9 @@ def make_split(df):
 
 # ------------------------------ data ------------------------------
 class Letterbox:
-    """Resize longest side to `size`, pad to square — keeps person proportions."""
+    """Resize longest side to `size`, pad to square — keeps proportions."""
     def __init__(self, size, fill=PAD_COLOR):
-        self.size, self.fill = size, fill
+        self.size, self.fill = size, tuple(fill)
 
     def __call__(self, img):
         w, h = img.size
@@ -227,13 +239,15 @@ class CropDataset(Dataset):
 
 
 # ------------------------------ model ------------------------------
-def build_model(name):
+def build_model(name, n_cls=N_CLS, pretrained=True):
     if name == "efficientnet_b0":
-        m = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-        m.classifier[1] = nn.Linear(m.classifier[1].in_features, len(CLASSES))
+        w = models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        m = models.efficientnet_b0(weights=w)
+        m.classifier[1] = nn.Linear(m.classifier[1].in_features, n_cls)
     elif name == "mobilenet_v3_large":
-        m = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V2)
-        m.classifier[3] = nn.Linear(m.classifier[3].in_features, len(CLASSES))
+        w = models.MobileNet_V3_Large_Weights.IMAGENET1K_V2 if pretrained else None
+        m = models.mobilenet_v3_large(weights=w)
+        m.classifier[3] = nn.Linear(m.classifier[3].in_features, n_cls)
     else:
         raise ValueError(name)
     return m
@@ -263,7 +277,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None, bac
             scaler.step(optimizer)
             scaler.update()
         total_loss += loss.item() * x.size(0)
-        probs.append(torch.softmax(logits.float(), 1)[:, 1].detach().cpu())
+        probs.append(torch.softmax(logits.float(), 1).detach().cpu())
         labels.append(y.cpu())
         idxs.append(i)
     n = len(loader.dataset)
@@ -271,18 +285,18 @@ def run_epoch(model, loader, criterion, device, optimizer=None, scaler=None, bac
             torch.cat(labels).numpy(), torch.cat(idxs).numpy())
 
 
-def metrics(probs, labels, thr=0.5):
-    pred = (probs >= thr).astype(int)
-    out = {
+def metrics(probs, labels):
+    pred = probs.argmax(1)
+    recalls = {}
+    for c, name in enumerate(CLASSES):
+        m = labels == c
+        recalls[name] = (pred[m] == c).mean() if m.any() else float("nan")
+    return {
         "acc": (pred == labels).mean(),
         "bal_acc": balanced_accuracy_score(labels, pred),
-        "f1_uniform": f1_score(labels, pred, zero_division=0),
+        "macro_f1": f1_score(labels, pred, average="macro", zero_division=0),
+        "recall": recalls,
     }
-    try:
-        out["auc"] = roc_auc_score(labels, probs)
-    except ValueError:
-        out["auc"] = float("nan")
-    return out
 
 
 def main():
@@ -300,10 +314,11 @@ def main():
     val_dl = DataLoader(CropDataset(va_df, val_tf), batch_size=BATCH_SIZE, shuffle=False,
                         num_workers=NUM_WORKERS, pin_memory=True)
 
-    # class weights handle imbalance between uniform / no_uniform
-    counts = np.bincount(tr_df["label"], minlength=len(CLASSES))
-    weights = torch.tensor(counts.sum() / (len(CLASSES) * counts), dtype=torch.float32, device=device)
-    print("Class weights:", weights.cpu().numpy().round(3))
+    # class weights compensate for imbalance (e.g. fewer not_a_person crops)
+    counts = np.bincount(tr_df["label"], minlength=N_CLS)
+    weights = torch.tensor(counts.sum() / (N_CLS * np.maximum(counts, 1)),
+                           dtype=torch.float32, device=device)
+    print("Class weights:", dict(zip(CLASSES, weights.cpu().numpy().round(3))))
     criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=LABEL_SMOOTHING)
 
     model = build_model(MODEL_NAME).to(device)
@@ -311,6 +326,7 @@ def main():
 
     best_score, best_epoch, bad_epochs = -1.0, 0, 0
     ckpt_path = f"{OUT_DIR}/uniform_classifier.pt"
+    short = {"no_uniform": "noU", "uniform": "U", "not_a_person": "bg"}
 
     for epoch in range(1, EPOCHS + 1):
         if epoch == 1:
@@ -333,12 +349,13 @@ def main():
             scheduler.step()
 
         tm, vm = metrics(tr_p, tr_y), metrics(va_p, va_y)
+        rec = " ".join(f"{short.get(k, k)}={v:.2f}" for k, v in vm["recall"].items())
         print(f"Ep {epoch:2d} | train loss {tr_loss:.4f} acc {tm['acc']:.3f} | "
               f"val loss {va_loss:.4f} acc {vm['acc']:.3f} bal_acc {vm['bal_acc']:.3f} "
-              f"f1 {vm['f1_uniform']:.3f} auc {vm['auc']:.3f} | {time.time() - t0:.0f}s")
+              f"mF1 {vm['macro_f1']:.3f} | recall {rec} | {time.time() - t0:.0f}s")
 
         if vm["bal_acc"] > best_score:
-            best_score, best_epoch, bad_epochs = vm["bal_acc"], epoch, 0
+            best_score, best_epoch, bad_epochs = float(vm["bal_acc"]), epoch, 0
             torch.save(model.state_dict(), ckpt_path)
             print("   ↳ saved best")
         else:
@@ -347,33 +364,31 @@ def main():
                 print(f"Early stopping (no improvement for {PATIENCE} epochs).")
                 break
 
-    # ------------------- best model: threshold + report -------------------
+    # ----------------------- best model: report -----------------------
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     _, va_p, va_y, va_i = run_epoch(model, val_dl, criterion, device)
+    pred = va_p.argmax(1)
 
-    thrs = np.linspace(0.05, 0.95, 91)
-    scores = [balanced_accuracy_score(va_y, (va_p >= t).astype(int)) for t in thrs]
-    best_thr = float(thrs[int(np.argmax(scores))])
+    print(f"\nBest epoch: {best_epoch}   val balanced acc: {best_score:.3f}\n")
+    print(classification_report(va_y, pred, labels=list(range(N_CLS)),
+                                target_names=CLASSES, digits=3, zero_division=0))
+    cm = confusion_matrix(va_y, pred, labels=list(range(N_CLS)))
+    print("Confusion matrix (rows = true, cols = predicted):")
+    print(pd.DataFrame(cm, index=CLASSES, columns=CLASSES))
 
-    print(f"\nBest epoch: {best_epoch}")
-    for name, t in [("thr=0.50", 0.5), (f"thr={best_thr:.2f} (tuned)", best_thr)]:
-        m = metrics(va_p, va_y, t)
-        cm = confusion_matrix(va_y, (va_p >= t).astype(int), labels=[0, 1])
-        print(f"\n[{name}] acc {m['acc']:.3f}  bal_acc {m['bal_acc']:.3f}  "
-              f"f1_uniform {m['f1_uniform']:.3f}  auc {m['auc']:.3f}")
-        print("Confusion matrix (rows=true, cols=pred) [no_uniform, uniform]:")
-        print(cm)
-
-    pred = (va_p >= best_thr).astype(int)
-    wrong = va_df.iloc[va_i[pred != va_y]].copy()
-    wrong["prob_uniform"] = va_p[pred != va_y]
-    wrong.to_csv(f"{OUT_DIR}/val_mistakes.csv", index=False)
+    wrong_mask = pred != va_y
+    wrong = va_df.iloc[va_i[wrong_mask]].copy()
+    wrong["true"] = [CLASSES[t] for t in va_y[wrong_mask]]
+    wrong["pred"] = [CLASSES[p] for p in pred[wrong_mask]]
+    for c, name in enumerate(CLASSES):
+        wrong[f"p_{name}"] = va_p[wrong_mask, c].round(3)
+    wrong.drop(columns=["label"]).to_csv(f"{OUT_DIR}/val_mistakes.csv", index=False)
     print(f"\n{len(wrong)} val mistakes saved to val_mistakes.csv — review them for label errors.")
 
     meta = {
         "model_name": MODEL_NAME, "classes": CLASSES, "img_size": IMG_SIZE,
-        "pad_color": PAD_COLOR, "mean": MEAN, "std": STD,
-        "threshold": best_thr, "best_epoch": best_epoch, "val_bal_acc": best_score,
+        "pad_color": list(PAD_COLOR), "mean": MEAN, "std": STD,
+        "decision": "argmax", "best_epoch": best_epoch, "val_bal_acc": best_score,
         "crop_padding_note": "expand detector box by 10% per side before classifying",
     }
     torch.save({"state_dict": model.state_dict(), "meta": meta}, ckpt_path)
@@ -395,20 +410,26 @@ def main():
 
 # ------------------------- inference helper -------------------------
 def load_classifier(ckpt_path=f"{OUT_DIR}/uniform_classifier.pt", device="cpu"):
-    ckpt = torch.load(ckpt_path, map_location=device)
-    m = build_model(ckpt["meta"]["model_name"])
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    meta = ckpt["meta"]
+    m = build_model(meta["model_name"], len(meta["classes"]), pretrained=False)
     m.load_state_dict(ckpt["state_dict"])
-    return m.eval().to(device), ckpt["meta"]
+    return m.eval().to(device), meta
 
 
 @torch.no_grad()
 def classify_crops(model, meta, pil_crops, device="cpu"):
-    """pil_crops: list of PIL RGB person crops (already padded 10% like training)."""
-    tf = transforms.Compose([Letterbox(meta["img_size"], tuple(meta["pad_color"])),
+    """pil_crops: list of PIL RGB crops (padded 10% like training).
+    Returns [(class_name, confidence, {class: prob}), ...]."""
+    tf = transforms.Compose([Letterbox(meta["img_size"], meta["pad_color"]),
                              transforms.ToTensor(), transforms.Normalize(meta["mean"], meta["std"])])
     x = torch.stack([tf(c) for c in pil_crops]).to(device)
-    p = torch.softmax(model(x), 1)[:, 1].cpu().numpy()
-    return [("uniform" if pi >= meta["threshold"] else "no_uniform", float(pi)) for pi in p]
+    p = torch.softmax(model(x), 1).cpu().numpy()
+    out = []
+    for row in p:
+        k = int(row.argmax())
+        out.append((meta["classes"][k], float(row[k]), dict(zip(meta["classes"], row.round(4).tolist()))))
+    return out
 
 
 if __name__ == "__main__":
