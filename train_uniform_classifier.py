@@ -434,3 +434,38 @@ def classify_crops(model, meta, pil_crops, device="cpu"):
 
 if __name__ == "__main__":
     main()
+
+
+!pip install -q onnx onnxscript onnxruntime
+
+import torch, torch.nn as nn
+from torchvision import models
+
+ckpt = torch.load("/kaggle/working/uniform_classifier.pt", map_location="cpu", weights_only=False)
+meta = ckpt["meta"]
+n = len(meta["classes"])
+
+if meta["model_name"] == "efficientnet_b0":
+    model = models.efficientnet_b0(weights=None)
+    model.classifier[1] = nn.Linear(model.classifier[1].in_features, n)
+else:
+    model = models.mobilenet_v3_large(weights=None)
+    model.classifier[3] = nn.Linear(model.classifier[3].in_features, n)
+model.load_state_dict(ckpt["state_dict"])
+model.eval()
+
+dummy = torch.randn(1, 3, meta["img_size"], meta["img_size"])
+torch.onnx.export(
+    model, dummy, "/kaggle/working/uniform_classifier.onnx",
+    input_names=["input"], output_names=["logits"],
+    dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+    opset_version=17, dynamo=False,
+)
+
+# Check the ONNX model gives the same outputs as PyTorch, with a batch of 4
+import numpy as np, onnxruntime as ort
+x = torch.randn(4, 3, meta["img_size"], meta["img_size"])
+with torch.no_grad():
+    ref = model(x).numpy()
+out = ort.InferenceSession("/kaggle/working/uniform_classifier.onnx").run(None, {"input": x.numpy()})[0]
+print("ONNX exported. Max difference vs PyTorch:", np.abs(ref - out).max())
