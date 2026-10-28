@@ -1,20 +1,24 @@
 """
-Local CPU test: YOLO26n person detection -> 3-class crop classifier
-                (uniform / no_uniform / not_a_person)
+Local CPU test: YOLO26n person detection + tracking -> 3-class crop classifier
+                (uniform / no_uniform / not_a_person), smoothed over time per person.
 
-Draws boxes + labels, shows the video in a resizable window, and saves the annotated output.
+Each person gets a track ID. Their class probabilities are averaged over the last
+--window frames, so a single bad frame (turning around, occlusion, motion blur) no
+longer flips the label.
+
   green  = uniform
   red    = no uniform
-  yellow = uncertain (top probability below --min-conf)
+  yellow = uncertain (smoothed top probability below --min-conf)
   gray   = not a person / too small   (hidden unless --show-bg)
 
 Install (once):
-    pip install ultralytics opencv-python pillow torch torchvision onnxruntime
+    pip install ultralytics opencv-python pillow torch torchvision onnxruntime lap
 
 Usage:
     python test_uniform_video.py --video test.mp4
+    python test_uniform_video.py --video test.mp4 --window 25
     python test_uniform_video.py --video test.mp4 --cls uniform_classifier.onnx --meta uniform_classifier_meta.json
-    python test_uniform_video.py --video test.mp4 --show-bg --min-conf 0.6 --window-width 1600
+    python test_uniform_video.py --video test.mp4 --no-track          # old per-frame behaviour
 
 Keys while playing:  q / Esc = quit,  space = pause/resume
 The window can also be resized freely with the mouse.
@@ -23,6 +27,7 @@ The window can also be resized freely with the mouse.
 import argparse
 import json
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -114,6 +119,26 @@ class OnnxClassifier:
         return softmax(self.sess.run(None, {self.inp: preprocess(pil_crops, self.meta)})[0])
 
 
+# ------------------------------- temporal smoothing -------------------------------
+class TrackSmoother:
+    """Keeps the last `window` probability vectors per track ID and averages them."""
+    def __init__(self, window, forget_after):
+        self.window, self.forget_after = window, forget_after
+        self.hist, self.last_seen = {}, {}
+
+    def update(self, tid, probs, frame_idx):
+        if tid not in self.hist:
+            self.hist[tid] = deque(maxlen=self.window)
+        self.hist[tid].append(probs)
+        self.last_seen[tid] = frame_idx
+        return np.mean(self.hist[tid], axis=0), len(self.hist[tid])
+
+    def prune(self, frame_idx):
+        stale = [t for t, f in self.last_seen.items() if frame_idx - f > self.forget_after]
+        for t in stale:
+            del self.hist[t], self.last_seen[t]
+
+
 # ------------------------------------ drawing ------------------------------------
 def draw_label(img, x1, y1, text, color):
     scale = max(0.5, min(img.shape[:2]) / 1000)
@@ -138,7 +163,7 @@ def draw_hud(img, lines):
 
 # -------------------------------------- main --------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Uniform detection test on a video (CPU, 3-class)")
+    ap = argparse.ArgumentParser(description="Uniform detection test on a video (CPU, 3-class, tracked)")
     ap.add_argument("--video", required=True, help="input video path")
     ap.add_argument("--det", default="yolo26n.pt", help="YOLO person detector weights")
     ap.add_argument("--cls", default="uniform_classifier.pt", help="classifier .pt or .onnx")
@@ -149,8 +174,18 @@ def main():
     ap.add_argument("--pad", type=float, default=0.10, help="crop padding per side (same as training)")
     ap.add_argument("--min-h", type=int, default=60, help="skip classifying persons shorter than this (px)")
     ap.add_argument("--min-conf", type=float, default=0.0,
-                    help="mark uniform/no-uniform as 'uncertain' if top probability is below this (e.g. 0.6)")
+                    help="mark uniform/no-uniform as 'uncertain' if smoothed top probability is below this")
+    ap.add_argument("--hide-uncertain", action="store_true",
+                    help="don't draw boxes marked 'uncertain' (still counted in the overlay)")
     ap.add_argument("--show-bg", action="store_true", help="also draw not-a-person and too-small boxes in gray")
+    # tracking / smoothing
+    ap.add_argument("--no-track", action="store_true", help="disable tracking (per-frame labels, may flicker)")
+    ap.add_argument("--tracker", default="bytetrack.yaml", help="bytetrack.yaml or botsort.yaml")
+    ap.add_argument("--window", type=int, default=15,
+                    help="frames of history averaged per person (bigger = steadier, slower to react)")
+    ap.add_argument("--warmup", type=int, default=3,
+                    help="frames a new track needs before its label is shown")
+    # display
     ap.add_argument("--window-width", type=int, default=1280, help="initial display window width")
     ap.add_argument("--threads", type=int, default=None, help="CPU threads for the classifier")
     ap.add_argument("--no-show", action="store_true", help="don't display, only save")
@@ -167,6 +202,8 @@ def main():
     for needed in ("uniform", "no_uniform", "not_a_person"):
         if needed not in classes:
             raise SystemExit(f"Classifier has no '{needed}' class — is this the 3-class model?")
+
+    smoother = TrackSmoother(window=args.window, forget_after=max(60, 3 * args.window))
 
     # --- video io ---
     cap = cv2.VideoCapture(args.video)
@@ -195,14 +232,23 @@ def main():
             frame_idx += 1
             t0 = time.time()
 
-            # 1) detect persons (class 0) — boxes are in original frame coordinates
-            res = detector.predict(frame, classes=[0], conf=args.conf, imgsz=args.imgsz,
-                                   device="cpu", verbose=False)[0]
-            boxes = res.boxes.xyxy.cpu().numpy().astype(int) if res.boxes is not None else []
+            # 1) detect (+ track) persons — boxes are in original frame coordinates
+            common = dict(classes=[0], conf=args.conf, imgsz=args.imgsz, device="cpu", verbose=False)
+            if args.no_track:
+                res = detector.predict(frame, **common)[0]
+            else:
+                res = detector.track(frame, persist=True, tracker=args.tracker, **common)[0]
+
+            if res.boxes is not None and len(res.boxes):
+                boxes = res.boxes.xyxy.cpu().numpy().astype(int)
+                ids = (res.boxes.id.cpu().numpy().astype(int).tolist()
+                       if res.boxes.id is not None else [None] * len(boxes))
+            else:
+                boxes, ids = [], []
 
             # 2) crop with padding from the full-res frame, BGR -> RGB
             crops, keep, small = [], [], []
-            for (x1, y1, x2, y2) in boxes:
+            for (x1, y1, x2, y2), tid in zip(boxes, ids):
                 bw, bh = x2 - x1, y2 - y1
                 if bh < args.min_h:
                     small.append((x1, y1, x2, y2))
@@ -214,14 +260,18 @@ def main():
                 if crop.size == 0:
                     continue
                 crops.append(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
-                keep.append((x1, y1, x2, y2))
+                keep.append(((x1, y1, x2, y2), tid))
 
             # 3) classify all crops of this frame in one batch
             probs = classifier(crops) if crops else np.zeros((0, len(classes)))
 
-            # 4) decide + draw
+            # 4) smooth per track, decide, draw
             counts = {"uniform": 0, "no_uniform": 0, "uncertain": 0, "not_a_person": 0}
-            for (x1, y1, x2, y2), p in zip(keep, probs):
+            for ((x1, y1, x2, y2), tid), p in zip(keep, probs):
+                if tid is not None:
+                    p, n_seen = smoother.update(tid, p, frame_idx)
+                    if n_seen < args.warmup:
+                        continue              # too new — wait for a few frames of evidence
                 k = int(p.argmax())
                 cls, conf = classes[k], float(p[k])
                 if cls != "not_a_person" and conf < args.min_conf:
@@ -230,13 +280,18 @@ def main():
 
                 if cls == "not_a_person" and not args.show_bg:
                     continue
+                if cls == "uncertain" and args.hide_uncertain:
+                    continue
                 color = COLORS[cls]
+                tag = f"#{tid} " if tid is not None else ""
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1 if cls == "not_a_person" else 2)
-                draw_label(frame, x1, y1, f"{DISPLAY[cls]} {conf:.2f}", color)
+                draw_label(frame, x1, y1, f"{tag}{DISPLAY[cls]} {conf:.2f}", color)
 
             if args.show_bg:
                 for (x1, y1, x2, y2) in small:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), COLORS["small"], 1)
+
+            smoother.prune(frame_idx)
 
             dt = time.time() - t0
             fps_avg = 0.9 * fps_avg + 0.1 * (1 / dt) if fps_avg else 1 / dt
