@@ -1,0 +1,15 @@
+[
+  {"name": "person", "attributes": []},
+  {"name": "truck", "attributes": []},
+  {"name": "helmet", "attributes": []},
+  {"name": "vest", "attributes": []},
+  {"name": "uniform", "attributes": []},
+  {"name": "non_compliant_clothing", "attributes": []},
+  {"name": "harness", "attributes": []},
+  {"name": "boots", "attributes": []},
+  {"name": "mask", "attributes": []},
+  {"name": "mask_improper", "attributes": []},
+  {"name": "face", "attributes": []},
+  {"name": "head", "attributes": []},
+  {"name": "non_safety_footwear", "attributes": []}
+]
