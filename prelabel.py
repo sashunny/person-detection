@@ -43,6 +43,7 @@ from torchvision.ops import nms
 CLASSES = [
     "person", "truck", "helmet", "vest", "uniform", "non_compliant_clothing",
     "harness", "boots", "mask", "mask_improper", "face", "head",
+    "non_safety_footwear",
 ]
 CID = {c: i for i, c in enumerate(CLASSES)}
 
@@ -55,7 +56,7 @@ MODELS = {
     "models/helmet.pt":  {"helmet": "helmet", "no_helmet": "head"},
     "models/vest.pt":    {"vest": "vest"},
     "models/harness.pt": {"harness": "harness"},
-    "models/boots.pt":   {"boots": "boots"},
+    "models/boots.pt":   {"boots": "boots", "no_boots": "non_safety_footwear"},
     "models/mask.pt":    {"mask": "mask", "no_mask": "face"},
 }
 
