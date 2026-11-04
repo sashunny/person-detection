@@ -135,7 +135,10 @@ def conf_for(cls_name: str) -> float:
 
 def run_detectors(images, imgsz, device):
     """Return {image name: list of [x1, y1, x2, y2, conf, class_id]} plus image sizes."""
+    import logging
     from ultralytics import YOLO
+    from ultralytics.utils import LOGGER
+    LOGGER.setLevel(logging.ERROR)     # silence per-image deprecation warnings
 
     dets = defaultdict(list)
     sizes = {}
@@ -147,21 +150,21 @@ def run_detectors(images, imgsz, device):
         unknown = set(mapping) - set(names.values())
         if unknown:
             print(f"WARNING {weights}: classes not in model, check MODELS: {sorted(unknown)}")
-        bar = tqdm(total=len(images), unit="img", dynamic_ncols=True,
-                   desc=f"[{step}/{len(MODELS)}] {Path(weights).stem}")
-        for r in model.predict(source=[str(p) for p in images], stream=True, conf=min_conf,
-                               imgsz=imgsz, device=device, half=device != "cpu", batch=1,
-                               verbose=False):
-            bar.update(1)
-            name = Path(r.path).name
+        # One image per call. (Passing a *list* of paths makes Ultralytics load and run
+        # all of them as one batch, which runs out of memory.)
+        for p in tqdm(images, unit="img", dynamic_ncols=True,
+                      desc=f"[{step}/{len(MODELS)}] {Path(weights).stem}"):
+            kw = {"half": True} if device != "cpu" else {}       # FP16 on GPU only
+            r = model.predict(source=str(p), conf=min_conf, imgsz=imgsz, device=device,
+                              verbose=False, **kw)[0]
+            name = p.name
             sizes[name] = r.orig_shape  # (h, w)
             for box, conf, cls in zip(r.boxes.xyxy.tolist(), r.boxes.conf.tolist(),
                                       r.boxes.cls.tolist()):
                 new = mapping.get(names[int(cls)])
                 if new and conf >= conf_for(new):
                     dets[name].append([*box, conf, CID[new]])
-        bar.close()
-        del model                      # free GPU memory before loading the next model
+        del model                     # free GPU memory before loading the next model
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
