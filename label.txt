@@ -1,15 +1,15 @@
 [
-  {"name": "person", "attributes": []},
-  {"name": "truck", "attributes": []},
-  {"name": "helmet", "attributes": []},
-  {"name": "vest", "attributes": []},
-  {"name": "uniform", "attributes": []},
-  {"name": "non_compliant_clothing", "attributes": []},
-  {"name": "harness", "attributes": []},
-  {"name": "boots", "attributes": []},
-  {"name": "mask", "attributes": []},
-  {"name": "mask_improper", "attributes": []},
-  {"name": "face", "attributes": []},
-  {"name": "head", "attributes": []},
-  {"name": "non_safety_footwear", "attributes": []}
+  {"name": "person", "type": "rectangle", "attributes": []},
+  {"name": "truck", "type": "rectangle", "attributes": []},
+  {"name": "helmet", "type": "rectangle", "attributes": []},
+  {"name": "vest", "type": "rectangle", "attributes": []},
+  {"name": "uniform", "type": "rectangle", "attributes": []},
+  {"name": "non_compliant_clothing", "type": "rectangle", "attributes": []},
+  {"name": "harness", "type": "rectangle", "attributes": []},
+  {"name": "boots", "type": "rectangle", "attributes": []},
+  {"name": "mask", "type": "rectangle", "attributes": []},
+  {"name": "mask_improper", "type": "rectangle", "attributes": []},
+  {"name": "face", "type": "rectangle", "attributes": []},
+  {"name": "head", "type": "rectangle", "attributes": []},
+  {"name": "non_safety_footwear", "type": "rectangle", "attributes": []}
 ]
