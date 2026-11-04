@@ -51,17 +51,21 @@ CID = {c: i for i, c in enumerate(CLASSES)}
 # The uniform model is NOT here: it is a classifier, configured in UNIFORM_CLASSIFIER below.
 # One of these models must output `person`, because the classifier runs on person boxes.
 MODELS = {
-    "models/person.pt":  {"person": "person"},
-    # "models/truck.pt": {"truck": "truck"},          # outdoor zones only
-    "models/helmet.pt":  {"helmet": "helmet", "no_helmet": "head"},
-    "models/vest.pt":    {"vest": "vest"},
-    "models/harness.pt": {"harness": "harness"},
-    "models/boots.pt":   {"boots": "boots", "no_boots": "non_safety_footwear"},
-    "models/mask.pt":    {"mask": "mask", "no_mask": "face"},
+    "pretrained_models/person.pt":  {"person": "person"},
+    # "pretrained_models/truck.pt": {"truck": "truck"},          # outdoor zones only
+    "pretrained_models/helmet.pt":  {"helmet": "helmet", "no_helmet": "head"},
+    "pretrained_models/vest.pt":    {"vest": "vest"},
+    "pretrained_models/harness.pt": {"harness": "harness"},
+    "pretrained_models/boots.pt":   {"boots": "boots", "no_boots": "non_safety_footwear"},
+    "pretrained_models/mask.pt":    {"mask": "mask", "no_mask": "face"},
 }
 
 UNIFORM_CLASSIFIER = {
-    "weights": "models/uniform_cls.pt",   # set to None to skip the classifier
+    "weights": "pretrained_models/uniform_classifier.pt",   # set to None to skip the classifier
+
+    # Optional metadata saved with the model. If found, class names, input size, mean/std and
+    # arch are read from it and OVERRIDE the values below (the script prints what it used).
+    "meta": "pretrained_models/uniform_classifier_meta.json",
 
     # How the .pt was saved:
     #   "auto"        - try everything below (recommended)
@@ -69,23 +73,24 @@ UNIFORM_CLASSIFIER = {
     #   "timm"        - state_dict of timm.create_model("efficientnet_b2", num_classes=N)
     #   "torchvision" - state_dict of torchvision.models.efficientnet_b2(num_classes=N)
     "loader": "auto",
-    "arch": "efficientnet_b2",
+    "arch": "efficientnet_b0",
 
-    # Output index order of the classifier. For ImageFolder training this is the
-    # alphabetical order of the class folder names. MUST match training.
-    "class_names": ["no_uniform", "not_a_person", "uniform"],
+    # Output index order of the classifier (from the meta file). MUST match training.
+    "class_names": ["no_uniform", "uniform", "not_a_person"],
 
-    # Classifier class -> new class (None = add no clothing box)
+    # Classifier class -> new class (None = add no clothing box).
+    # Matching ignores case, spaces, hyphens and underscores ("No Uniform" == "no_uniform").
     "map": {"uniform": "uniform", "no_uniform": "non_compliant_clothing", "not_a_person": None},
 
     # Preprocessing - copy these from your training/inference transforms.
-    "input_size": (260, 260),             # (height, width)
-    "resize": "squash",                   # "squash" = resize to input_size ignoring aspect
-                                          # "letterbox" = keep aspect, pad with grey
+    "input_size": (224, 224),             # (height, width)
+    "resize": "letterbox",                # "letterbox" = keep aspect, pad with pad_color
+                                          # "squash" = resize to input_size ignoring aspect
+    "pad_color": (114, 114, 114),
     "mean": (0.485, 0.456, 0.406),        # ImageNet defaults
     "std": (0.229, 0.224, 0.225),
-    "crop_pad": 0.05,                     # expand the person box by 5% each side before cropping
-                                          # (set to whatever your crop pipeline used)
+    "crop_pad": 0.10,                     # expand the person box by 10% per side before
+                                          # cropping (meta: crop_padding_note)
 
     "min_conf": 0.5,          # below this, add no clothing box (annotator decides)
     "min_person_px": 40,      # skip people shorter than this (too small to judge clothing)
@@ -185,6 +190,108 @@ def apply_vest_rule(boxes):
 # ================================================================ uniform classifier
 
 
+def _norm(name):
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def _flatten(d, out=None):
+    """Flatten nested dicts into one {key: value} dict (inner keys win only if new)."""
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict) and _norm(k) not in ("idxtoclass", "classtoidx", "classes",
+                                                     "classnames", "labels", "names"):
+            _flatten(v, out)
+        else:
+            out.setdefault(_norm(k), v)
+    return out
+
+
+def _class_names_from(v):
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return v
+    if isinstance(v, dict) and v:
+        keys, vals = list(v.keys()), list(v.values())
+        if all(str(k).lstrip("-").isdigit() for k in keys):       # {"0": "no_uniform", ...}
+            return [v[k] for k in sorted(keys, key=lambda k: int(k))]
+        if all(isinstance(x, int) for x in vals):                  # {"no_uniform": 0, ...}
+            return [k for k, _ in sorted(v.items(), key=lambda kv: kv[1])]
+    return None
+
+
+def apply_meta(cfg):
+    """Read the classifier's meta JSON (if any) and override cfg values found in it."""
+    import json
+    path = cfg.get("meta")
+    if not path or not Path(path).exists():
+        if path:
+            print(f"Note: meta file {path} not found; using UNIFORM_CLASSIFIER values.")
+        return cfg
+    flat = _flatten(json.loads(Path(path).read_text()))
+    cfg, used, consumed = dict(cfg), [], set()
+
+    for key in ("idxtoclass", "classnames", "classes", "labels", "names", "classtoidx"):
+        names = _class_names_from(flat.get(key))
+        if names:
+            cfg["class_names"], _ = names, used.append(f"class_names={names}")
+            consumed.add(key)
+            break
+    else:
+        print(f"WARNING: no class names found in {path}; using {cfg['class_names']} - verify!")
+
+    for key in ("inputsize", "imgsize", "imagesize", "imgsz", "resolution", "size",
+                "inputshape", "inputdim"):
+        v = flat.get(key)
+        if isinstance(v, int):
+            cfg["input_size"] = (v, v)
+        elif isinstance(v, list) and len(v) in (2, 3) and all(isinstance(x, int) for x in v):
+            hw = [x for x in v if x != 3] if len(v) == 3 else v       # drop channel dim
+            cfg["input_size"] = (hw[0], hw[-1])
+        else:
+            continue
+        used.append(f"input_size={cfg['input_size']}")
+        consumed.add(key)
+        break
+
+    for key in ("mean", "std"):
+        v = flat.get(key) or flat.get(f"normalize{key}") or flat.get(f"norm{key}")
+        if isinstance(v, list) and len(v) == 3:
+            cfg[key] = tuple(float(x) for x in v)
+            used.append(f"{key}={cfg[key]}")
+
+    pad = flat.get("padcolor")
+    if isinstance(pad, list) and len(pad) == 3:
+        cfg["pad_color"], cfg["resize"] = tuple(int(x) for x in pad), "letterbox"
+        used.append(f"letterbox, pad_color={cfg['pad_color']}")
+        consumed.add("padcolor")
+
+    decision = flat.get("decision")
+    if decision is not None:
+        consumed.add("decision")
+        if str(decision).lower() != "argmax":
+            print(f"WARNING: meta decision={decision!r}; this script uses argmax + min_conf.")
+
+    for key in ("arch", "architecture", "modelname", "backbone", "model"):
+        v = flat.get(key)
+        if isinstance(v, str):
+            cfg["arch"] = v.replace("-", "_").lower()
+            used.append(f"arch={cfg['arch']}")
+            consumed.add(key)
+            break
+
+    print(f"From {path}: " + ("; ".join(used) if used else "nothing usable"))
+    consumed |= {"mean", "std", "normalizemean", "normalizestd", "normmean", "normstd"}
+    other = sorted(k for k in flat if k not in consumed)
+    if other:
+        print(f"  other keys in meta (check if preprocessing-related): {other}")
+
+    norm_map = {_norm(k) for k in cfg["map"]}
+    missing = [c for c in cfg["class_names"] if _norm(c) not in norm_map]
+    if missing:
+        print(f"WARNING: classifier classes {missing} are not in UNIFORM_CLASSIFIER['map'] - "
+              "they will add no clothing box. Add them to 'map'.")
+    return cfg
+
+
 def _unwrap_state_dict(obj):
     if isinstance(obj, dict):
         for key in ("state_dict", "model_state_dict", "model", "net", "ema"):
@@ -251,7 +358,7 @@ def _preprocess(crop, cfg):
     if cfg["resize"] == "letterbox":
         scale = min(w / crop.width, h / crop.height)
         nw, nh = max(1, round(crop.width * scale)), max(1, round(crop.height * scale))
-        canvas = Image.new("RGB", (w, h), (114, 114, 114))
+        canvas = Image.new("RGB", (w, h), tuple(cfg.get("pad_color", (114, 114, 114))))
         canvas.paste(crop.resize((nw, nh), Image.BILINEAR), ((w - nw) // 2, (h - nh) // 2))
         crop = canvas
     else:
@@ -304,7 +411,7 @@ def add_uniform_labels(model, image_path, boxes, cfg, device, stats):
         stats[f"{cls_name} ({'kept' if p >= cfg['min_conf'] else 'low conf'})"] += 1
         if p < cfg["min_conf"]:
             continue
-        new = cfg["map"].get(cls_name)
+        new = {_norm(k): v for k, v in cfg["map"].items()}.get(_norm(cls_name))
         if new:
             boxes.append([*boxes[i][:4], p, CID[new]])
         elif cfg["drop_person_if_not_person"]:
@@ -350,6 +457,8 @@ def main():
                     help="only classify these person-crop images and print the result")
     args = ap.parse_args()
     cfg = UNIFORM_CLASSIFIER
+    if cfg["weights"]:
+        cfg = apply_meta(cfg)
     tdev = torch_device(args.device)
 
     if args.check_classifier:
