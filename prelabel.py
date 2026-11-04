@@ -29,6 +29,8 @@ Before running, edit the CONFIGURATION section:
 """
 
 import argparse
+import gc
+import os
 import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -36,6 +38,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from tqdm import tqdm
 from torchvision.ops import nms
 
 # ================================================================ CONFIGURATION
@@ -54,8 +57,7 @@ MODELS = {
     "../pretrained_models/person_model.pt": {"person": "person"},
     # "../pretrained_models/truck.pt":      {"truck": "truck"},          # outdoor zones only
     "../pretrained_models/hardhat_v2.pt":   {"hardhat": "helmet", "no_hardhat": "head"},
-    "../pretrained_models/vest.pt":         {"vest": "vest", "person": "person",
-                                             "hat": "helmet", "nohat": "head"},
+    "../pretrained_models/vest.pt":         {"vest": "vest"},
     "../pretrained_models/harness.pt":      {"Harness": "harness"},
     "../pretrained_models/Boots_model.pt":  {"boot": "boots", "no boot": "non_safety_footwear"},
     "../pretrained_models/mask.pt":         {"Improper Mask": "mask_improper", "Mask": "mask",
@@ -63,11 +65,11 @@ MODELS = {
 }
 
 UNIFORM_CLASSIFIER = {
-    "weights": "pretrained_models/uniform_classifier.pt",   # set to None to skip the classifier
+    "weights": "../pretrained_models/uniform_classifier.pt",   # set to None to skip the classifier
 
     # Optional metadata saved with the model. If found, class names, input size, mean/std and
     # arch are read from it and OVERRIDE the values below (the script prints what it used).
-    "meta": "pretrained_models/uniform_classifier_meta.json",
+    "meta": "../pretrained_models/uniform_classifier_meta.json",
 
     # How the .pt was saved:
     #   "auto"        - try everything below (recommended)
@@ -102,9 +104,22 @@ UNIFORM_CLASSIFIER = {
     "batch_size": 64,
 }
 
-# Low thresholds favour recall: deleting a wrong box is faster than drawing a missing one.
-DEFAULT_CONF = 0.35
-CONF = {"harness": 0.25, "boots": 0.25, "mask": 0.25, "mask_improper": 0.25}
+# Confidence thresholds. Too low = annotators spend their time deleting junk boxes;
+# too high = they draw missing ones. Tune after looking at ~20 frames.
+DEFAULT_CONF = 0.5
+CONF = {"person": 0.5, "head": 0.5, "face": 0.5,
+        "harness": 0.4, "boots": 0.4, "non_safety_footwear": 0.4,
+        "mask": 0.4, "mask_improper": 0.4}
+
+# Classes that can't be on the same object. If boxes from one group overlap above
+# EXCLUSIVE_IOU, only the most confident one is kept (e.g. helmet vs head on one head).
+EXCLUSIVE = [
+    {"helmet", "head"},
+    {"mask", "mask_improper", "face"},
+    {"boots", "non_safety_footwear"},
+    {"uniform", "non_compliant_clothing"},
+]
+EXCLUSIVE_IOU = 0.4
 
 NMS_IOU = 0.6           # merge same-class boxes from different models above this IoU
 VEST_IN_BOX = 0.6       # a vest "belongs" to a box if this share of the vest lies inside it
@@ -126,16 +141,18 @@ def run_detectors(images, imgsz, device):
     sizes = {}
     min_conf = min([DEFAULT_CONF, *CONF.values()])
 
-    for weights, mapping in MODELS.items():
+    for step, (weights, mapping) in enumerate(MODELS.items(), 1):
         model = YOLO(weights)
         names = model.names
         unknown = set(mapping) - set(names.values())
         if unknown:
             print(f"WARNING {weights}: classes not in model, check MODELS: {sorted(unknown)}")
-        print(f"Running {weights} ...")
-
+        bar = tqdm(total=len(images), unit="img", dynamic_ncols=True,
+                   desc=f"[{step}/{len(MODELS)}] {Path(weights).stem}")
         for r in model.predict(source=[str(p) for p in images], stream=True, conf=min_conf,
-                               imgsz=imgsz, device=device, half=device != "cpu", verbose=False):
+                               imgsz=imgsz, device=device, half=device != "cpu", batch=1,
+                               verbose=False):
+            bar.update(1)
             name = Path(r.path).name
             sizes[name] = r.orig_shape  # (h, w)
             for box, conf, cls in zip(r.boxes.xyxy.tolist(), r.boxes.conf.tolist(),
@@ -143,6 +160,11 @@ def run_detectors(images, imgsz, device):
                 new = mapping.get(names[int(cls)])
                 if new and conf >= conf_for(new):
                     dets[name].append([*box, conf, CID[new]])
+        bar.close()
+        del model                      # free GPU memory before loading the next model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return dets, sizes
 
 
@@ -166,7 +188,18 @@ def dedupe(boxes):
     for c in t[:, 5].unique():
         sub = t[t[:, 5] == c]
         kept.append(sub[nms(sub[:, :4], sub[:, 4], NMS_IOU)])
-    return torch.cat(kept).tolist()
+    t = torch.cat(kept)
+
+    # contradictory classes on the same object: keep the most confident
+    for group in EXCLUSIVE:
+        ids = torch.tensor([CID[c] for c in group])
+        in_group = torch.isin(t[:, 5], ids)
+        if in_group.sum() < 2:
+            continue
+        sub, rest = t[in_group], t[~in_group]
+        sub = sub[nms(sub[:, :4], sub[:, 4], EXCLUSIVE_IOU)]
+        t = torch.cat([rest, sub])
+    return t.tolist()
 
 
 def has_vest(boxes, person_boxes):
@@ -455,13 +488,29 @@ def main():
     ap.add_argument("--out", default="prelabels.zip")
     ap.add_argument("--imgsz", type=int, default=960)
     ap.add_argument("--device", default="0", help="GPU index or 'cpu'")
+    ap.add_argument("--models-dir", default=None,
+                    help="folder holding all model files; overrides the folders written in "
+                         "MODELS / UNIFORM_CLASSIFIER (file names are kept), e.g. on Kaggle")
+    ap.add_argument("--threads", type=int, default=None,
+                    help="CPU threads to use (default: all cores minus 2, so the PC stays usable)")
     ap.add_argument("--check-classifier", nargs="+", metavar="CROP",
                     help="only classify these person-crop images and print the result")
     args = ap.parse_args()
     cfg = UNIFORM_CLASSIFIER
+    if args.models_dir:
+        relocate = lambda f: str(Path(args.models_dir) / Path(f).name) if f else f
+        MODELS.update({relocate(k): MODELS.pop(k) for k in list(MODELS)})
+        cfg = dict(cfg, weights=relocate(cfg["weights"]), meta=relocate(cfg["meta"]))
+    for f in [*MODELS, cfg["weights"], cfg["meta"]]:
+        if f and not Path(f).exists():
+            raise SystemExit(f"Model file not found: {f}")
     if cfg["weights"]:
         cfg = apply_meta(cfg)
     tdev = torch_device(args.device)
+    if tdev == "cpu":
+        n = args.threads or max(1, (os.cpu_count() or 4) - 2)
+        torch.set_num_threads(n)
+        print(f"Running on CPU with {n} threads")
 
     if args.check_classifier:
         model = load_classifier(cfg, tdev)
@@ -480,13 +529,14 @@ def main():
         raise SystemExit("The uniform classifier needs a detector in MODELS that outputs 'person'.")
     print(f"{len(images)} images")
 
-    classifier = load_classifier(cfg, tdev) if cfg["weights"] else None
     dets, sizes = run_detectors(images, args.imgsz, args.device)
+    classifier = load_classifier(cfg, tdev) if cfg["weights"] else None  # after detectors
 
     stats = Counter()
     by_name = {p.name: p for p in images}
     cleaned = {}
-    for name in sizes:
+    for name in tqdm(sizes, desc="Merging + uniform classifier", unit="img",
+                     dynamic_ncols=True):
         boxes = dedupe(dets.get(name, []))
         if classifier is not None:
             boxes = add_uniform_labels(classifier, by_name[name], boxes, cfg, tdev, stats)
