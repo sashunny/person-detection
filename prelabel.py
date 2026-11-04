@@ -51,13 +51,15 @@ CID = {c: i for i, c in enumerate(CLASSES)}
 # The uniform model is NOT here: it is a classifier, configured in UNIFORM_CLASSIFIER below.
 # One of these models must output `person`, because the classifier runs on person boxes.
 MODELS = {
-    "pretrained_models/person.pt":  {"person": "person"},
-    # "pretrained_models/truck.pt": {"truck": "truck"},          # outdoor zones only
-    "pretrained_models/helmet.pt":  {"helmet": "helmet", "no_helmet": "head"},
-    "pretrained_models/vest.pt":    {"vest": "vest"},
-    "pretrained_models/harness.pt": {"harness": "harness"},
-    "pretrained_models/boots.pt":   {"boots": "boots", "no_boots": "non_safety_footwear"},
-    "pretrained_models/mask.pt":    {"mask": "mask", "no_mask": "face"},
+    "../pretrained_models/person_model.pt": {"person": "person"},
+    # "../pretrained_models/truck.pt":      {"truck": "truck"},          # outdoor zones only
+    "../pretrained_models/hardhat_v2.pt":   {"hardhat": "helmet", "no_hardhat": "head"},
+    "../pretrained_models/vest.pt":         {"vest": "vest", "person": "person",
+                                             "hat": "helmet", "nohat": "head"},
+    "../pretrained_models/harness.pt":      {"Harness": "harness"},
+    "../pretrained_models/Boots_model.pt":  {"boot": "boots", "no boot": "non_safety_footwear"},
+    "../pretrained_models/mask.pt":         {"Improper Mask": "mask_improper", "Mask": "mask",
+                                             "No Mask": "face"},
 }
 
 UNIFORM_CLASSIFIER = {
