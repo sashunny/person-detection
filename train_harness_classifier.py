@@ -15,6 +15,12 @@ Usage (dev server GPU)
   python train_harness_classifier.py --data crops --out harness_model
 
   --ignore unsure      train only harness vs no_harness
+  --max-per-video 30   keep at most 30 crops per class per video (stops one video of the
+                       same few workers from dominating; also cuts near-duplicates)
+  --val-videos A B     choose the val videos yourself (best: videos with BOTH classes)
+  --split time         keep every video in train; val = separate time blocks inside each
+                       video, with a gap around them so near-duplicates can't leak
+                       (--block-seconds, --gap-seconds, --video-fps)
   --arch efficientnet_b2 --img-size 260    bigger model, if B0 isn't enough
 
 Output (harness_model/)
@@ -30,6 +36,7 @@ import json
 import random
 import re
 import time
+import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -57,6 +64,74 @@ def load_items(root, ignore):
     items = [(p, i) for i, c in enumerate(classes) for p in sorted((Path(root) / c).rglob("*"))
              if p.suffix.lower() in IMG_EXTS]
     return classes, items
+
+
+def cap_per_video(items, cap, seed):
+    """Keep at most `cap` crops per (video, class), spread evenly over the video."""
+    by = defaultdict(list)
+    for it in items:
+        by[(video_of(it[0]), it[1])].append(it)
+    out = []
+    for key, its in sorted(by.items()):
+        its = sorted(its, key=lambda it: it[0].name)
+        if len(its) > cap:                               # evenly spaced over time
+            idx = np.linspace(0, len(its) - 1, cap).round().astype(int)
+            its = [its[i] for i in sorted(set(idx))]
+        out += its
+    return out
+
+
+def frame_of(path):
+    m = re.search(r"_f(\d+)_p\d+$", path.stem)
+    return int(m.group(1)) if m else None
+
+
+def split_by_time(items, n_classes, val_frac, block_s, gap_s, fps):
+    """Inside every video: cut the timeline into blocks, send every k-th block to val and
+    drop train crops within gap_s of a val block (they'd be near-duplicates)."""
+    if any(frame_of(p) is None for p, _ in items):
+        raise SystemExit("--split time needs crop names like <video>_f<frame>_p<n>.jpg")
+    k = max(2, round(1 / val_frac))
+    block, gap = block_s * fps, gap_s * fps
+    total = Counter(c for _, c in items)
+    best = None
+    for offset in range(k):                              # pick the offset with the best balance
+        train, val, dropped = [], [], 0
+        by_video = defaultdict(list)
+        for it in items:
+            by_video[video_of(it[0])].append(it)
+        for v, its in by_video.items():
+            val_blocks = {b for b in range(int(max(frame_of(p) for p, _ in its) // block) + 1)
+                          if (b + offset + zlib.crc32(v.encode()) % k) % k == 0}
+            for it in its:
+                f = frame_of(it[0])
+                b = int(f // block)
+                if b in val_blocks:
+                    val.append(it)
+                elif any(abs(f - (vb * block)) < gap or abs(f - (vb + 1) * block) < gap
+                         for vb in val_blocks):
+                    dropped += 1                         # too close to a val block
+                else:
+                    train.append(it)
+        vc = Counter(c for _, c in val)
+        score = sum(abs(vc[c] / max(total[c], 1) - val_frac) + (1 if vc[c] == 0 else 0)
+                    for c in range(n_classes))
+        if best is None or score < best[0]:
+            best = (score, train, val, dropped)
+    _, train, val, dropped = best
+    print(f"Time split: {len(train)} train, {len(val)} val, {dropped} dropped as near-duplicates "
+          f"(blocks {block_s}s, gap {gap_s}s)")
+    return train, val, ["(time blocks inside every video)"], len({video_of(p) for p, _ in items})
+
+
+def split_fixed(items, val_videos):
+    names = {video_of(p) for p, _ in items}
+    missing = [v for v in val_videos if v not in names]
+    if missing:
+        raise SystemExit(f"--val-videos not found: {missing}. Videos: {sorted(names)}")
+    val = [it for it in items if video_of(it[0]) in val_videos]
+    train = [it for it in items if video_of(it[0]) not in val_videos]
+    return train, val, sorted(val_videos), len(names)
 
 
 def split_by_video(items, n_classes, val_frac, seed, trials=5000):
@@ -174,6 +249,15 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--val-frac", type=float, default=0.2)
+    ap.add_argument("--split", choices=["video", "time"], default="video",
+                    help="video: whole videos go to val; time: val = time blocks in every video")
+    ap.add_argument("--block-seconds", type=float, default=30)
+    ap.add_argument("--gap-seconds", type=float, default=10)
+    ap.add_argument("--video-fps", type=float, default=25, help="fps of the source videos")
+    ap.add_argument("--val-videos", nargs="*", default=None,
+                    help="video names to use as val (instead of an automatic split)")
+    ap.add_argument("--max-per-video", type=int, default=None,
+                    help="max crops per class per video (applied to train only)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-pretrained", action="store_true", help="(testing only)")
@@ -188,9 +272,23 @@ def main():
         print("WARNING: no CUDA GPU visible - training on CPU will be slow.")
 
     classes, items = load_items(args.data, set(args.ignore))
-    train, val, val_videos, n_videos = split_by_video(items, len(classes), args.val_frac, args.seed)
+    if args.split == "time":
+        train, val, val_videos, n_videos = split_by_time(
+            items, len(classes), args.val_frac, args.block_seconds, args.gap_seconds,
+            args.video_fps)
+    elif args.val_videos:
+        train, val, val_videos, n_videos = split_fixed(items, set(args.val_videos))
+    else:
+        train, val, val_videos, n_videos = split_by_video(items, len(classes), args.val_frac,
+                                                          args.seed)
+    if args.max_per_video:
+        before = len(train)
+        train = cap_per_video(train, args.max_per_video, args.seed)
+        print(f"--max-per-video {args.max_per_video}: train {before} -> {len(train)} crops")
+    print("Val videos: " + ", ".join(val_videos))
     tc, vc = Counter(c for _, c in train), Counter(c for _, c in val)
-    print(f"{len(items)} crops from {n_videos} videos; val = {len(val_videos)} videos\n")
+    where = "time blocks in every video" if args.split == "time" else f"{len(val_videos)} videos"
+    print(f"{len(items)} crops from {n_videos} videos; val = {where}\n")
     print(f"  {'class':12s} {'train':>6s} {'val':>5s}")
     for i, c in enumerate(classes):
         flag = "  <- NOT IN VAL" if vc[i] == 0 else ""
