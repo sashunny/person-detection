@@ -3,10 +3,10 @@ Test the harness pipeline on video(s): YOLO detector (person + truck) -> crop ea
 truck (+10% padding) -> harness classifier. Shows it live in a resizable window and saves the
 annotated video plus a CSV of every classification.
 
-Each person is tracked across frames; the label shown is the average of their last few
-classifier results, and "NO HARNESS - ALERT" appears only when no_harness has held for
---alert-seconds (like the production rules engine would do). Low-confidence results are shown
-as "unsure" and never alert.
+Every person on a truck is labelled either harness (green) or no_harness (red). Each person
+is tracked across frames and the label is the average of their last few classifier results,
+so one bad frame doesn't flip it (--smooth 1 shows the raw result of every frame). If the
+classifier also has an 'unsure' class, it is ignored.
 
 Usage (laptop, CPU)
   pip install -U ultralytics timm lap        (lap is needed for tracking)
@@ -34,7 +34,7 @@ import torch
 
 VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".m4v", ".ts", ".flv", ".wmv"}
 WINDOW = "Harness test  (q = quit, space = pause)"
-GREEN, RED, ORANGE, GREY, BLUE = (0, 200, 0), (0, 0, 255), (0, 165, 255), (160, 160, 160), (255, 140, 0)
+GREEN, RED, GREY = (0, 200, 0), (0, 0, 255), (160, 160, 160)
 
 
 # ---------------------------------------------------------------- classifier
@@ -149,8 +149,8 @@ def run_video(det, ids, clf, path, args, show, log):
             show = False
 
     history = defaultdict(lambda: deque(maxlen=args.smooth))   # track id -> recent probs
-    no_since = {}                                              # track id -> time no_harness began
-    drawn, idx, paused, stopped, alerts = [], 0, False, False, set()
+    drawn, idx, paused, stopped = [], 0, False, False
+    seen = {"harness": set(), "no_harness": set()}             # track ids per label
     infer_ms = 0.0
     print(f"\n{path.name}: {w}x{h} @ {fps:.0f} fps, {n} frames, model every {step} frames")
     while True:
@@ -189,32 +189,23 @@ def run_video(det, ids, clf, path, args, show, log):
                     key = t if t is not None else id(b)
                     history[key].append(p)
                     avg = np.mean(history[key], axis=0)
-                    cls = clf.classes[int(avg.argmax())]
-                    conf = float(avg.max())
-                    if cls == "no_harness" and conf >= args.min_conf:
-                        no_since.setdefault(key, t_sec)
-                    else:
-                        no_since.pop(key, None)
-                    alert = key in no_since and t_sec - no_since[key] >= args.alert_seconds
+                    ph, pn = avg[hi], avg[ni]                # ignore any 'unsure' class
+                    cls = "harness" if ph >= pn else "no_harness"
+                    conf = float(max(ph, pn) / max(ph + pn, 1e-9))
                     tag = f"ID{t} " if t is not None else ""
-                    if alert:
-                        text, color = f"{tag}NO HARNESS - ALERT {conf:.2f}", RED
-                        alerts.add(key)
-                    elif conf < args.min_conf or cls not in ("harness", "no_harness"):
-                        text, color = f"{tag}unsure {conf:.2f}", BLUE
-                    elif cls == "harness":
-                        text, color = f"{tag}harness {conf:.2f}", GREEN
-                    else:
-                        text, color = f"{tag}no harness {conf:.2f}", ORANGE
-                    drawn.append((b, text, color))
+                    color = GREEN if cls == "harness" else RED
+                    drawn.append((b, f"{tag}{cls} {conf:.2f}", color))
+                    seen[cls].add(key)
                     log.writerow([path.name, idx, f"{t_sec:.2f}", t, *map(int, b),
-                                  f"{p[hi]:.3f}", f"{p[ni]:.3f}", cls, f"{conf:.3f}", int(alert)])
+                                  f"{p[hi]:.3f}", f"{p[ni]:.3f}", cls, f"{conf:.3f}"])
                 infer_ms = 1000 * (time.perf_counter() - t0)
             for b, text, color in drawn:
                 label_box(frame, b, text, color, th)
             pct = f"{100 * idx / n:3.0f}%  " if n else ""
-            info_bar(frame, f"{pct}on truck: {sum(1 for d in drawn if d[1])}   "
-                            f"alerts so far: {len(alerts)}   {infer_ms:.0f} ms/frame", th)
+            n_h = sum(1 for d in drawn if d[2] == GREEN)
+            n_n = sum(1 for d in drawn if d[2] == RED)
+            info_bar(frame, f"{pct}harness: {n_h}   no_harness: {n_n}   "
+                            f"{infer_ms:.0f} ms/frame", th)
             writer.write(frame)
             idx += 1
         if show:
@@ -231,7 +222,10 @@ def run_video(det, ids, clf, path, args, show, log):
                 break
     cap.release()
     writer.release()
-    print(f"  saved {out_path}; people who triggered an alert: {len(alerts)}")
+    print(f"  saved {out_path}")
+    if args.track:
+        print(f"  tracked people labelled harness: {len(seen['harness'])}, "
+              f"no_harness: {len(seen['no_harness'])} (a person can appear in both)")
     return show, stopped
 
 
@@ -247,9 +241,7 @@ def main():
     ap.add_argument("--det-conf", type=float, default=0.4)
     ap.add_argument("--pad", type=float, default=0.10, help="crop padding (as in training)")
     ap.add_argument("--min-height", type=int, default=60, help="skip people smaller than this")
-    ap.add_argument("--min-conf", type=float, default=0.7, help="below this -> 'unsure'")
     ap.add_argument("--smooth", type=int, default=5, help="average over last N results per person")
-    ap.add_argument("--alert-seconds", type=float, default=3, help="no_harness held this long -> alert")
     ap.add_argument("--all-persons", action="store_true", help="classify people not on trucks too")
     ap.add_argument("--no-track", dest="track", action="store_false",
                     help="don't track people (no smoothing across frames)")
@@ -278,11 +270,10 @@ def main():
         try:
             import lap  # noqa: F401  (used by Ultralytics' tracker)
         except ImportError:
-            print("Package 'lap' not installed - running without tracking (no smoothing or "
-                  "alerts over time). Fix: pip install lap")
+            print("Package 'lap' not installed - running without tracking (no smoothing over time). "
+                  "Fix: pip install lap")
             args.track = False
-    print(f"Classifier classes {clf.classes} @ {clf.size}px; unsure below {args.min_conf}; "
-          f"alert after {args.alert_seconds}s of no_harness")
+    print(f"Classifier classes {clf.classes} @ {clf.size}px; smoothing over {args.smooth} results")
 
     src = Path(args.video)
     videos = sorted(p for p in src.rglob("*") if p.suffix.lower() in VIDEO_EXTS) \
@@ -298,7 +289,7 @@ def main():
     with open(Path(args.out) / "harness_predictions.csv", "w", newline="") as f:
         log = csv.writer(f)
         log.writerow(["video", "frame", "time_s", "track_id", "x1", "y1", "x2", "y2",
-                      "p_harness", "p_no_harness", "smoothed_class", "smoothed_conf", "alert"])
+                      "p_harness", "p_no_harness", "label", "label_conf"])
         for v in videos:
             show, stopped = run_video(det, ids, clf, v, args, show, log)
             det.predictor = None                     # fresh tracker for the next video
