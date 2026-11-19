@@ -1,15 +1,22 @@
 """
-Train the plant-2 model: helmet / no helmet (head), boots / no boots (non_safety_footwear),
-plus person. Fine-tunes your plant-1 YOLO26 model on plant-2 data, optionally mixed with the
+Train the plant-2 model: person, truck, helmet / no helmet (head), boots / no boots
+(non_safety_footwear). Fine-tunes your plant-1 YOLO26 model on plant-2 data, optionally mixed with the
 plant-1 data (recommended - more data, and the model keeps working at both sites).
 
 Input
   --plant2   CVAT export(s) in "Ultralytics YOLO Detection" or "... Detection Track" format
              (unzipped folder with data.yaml, images/, labels/). Track IDs are stripped.
   --plant1   (optional) the plant-1 YOLO dataset made by prepare_datasets.py
-             (datasets/ppe/yolo). Its own train/val split is kept; only the 5 classes
-             below are used, all other classes are dropped.
-  --weights  model to start from: plant-1 best.pt (default advice) or e.g. yolo26m.pt
+             (datasets/ppe/yolo). Its own train/val split is kept; only the classes
+             in --classes are used, all other classes are dropped.
+  --weights  model to start from: plant-1 best.pt (recommended: it already knows every class
+             below, so each class keeps its learned weights) or e.g. yolo26m.pt
+  --classes  classes to train (default: person truck helmet head boots non_safety_footwear);
+             add harness here later once plant-2 frames are labelled for it
+
+Every plant-2 frame must be labelled for EVERY class in --classes. An export whose frames
+were annotated before a class was added (e.g. no truck boxes at all) teaches the model that
+class is background - the script warns about this; fix those exports or leave them out.
 
 Plant-2 frames are split train/val by VIDEO (file name before "frame<number>"), same as
 prepare_datasets.py, so near-identical frames never leak into val.
@@ -37,7 +44,8 @@ from pathlib import Path
 
 import yaml
 
-CLASSES = ["person", "helmet", "head", "boots", "non_safety_footwear"]
+DEFAULT_CLASSES = ["person", "truck", "helmet", "head", "boots", "non_safety_footwear"]
+CLASSES = list(DEFAULT_CLASSES)        # replaced by --classes in main()
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
@@ -81,7 +89,16 @@ def load_cvat_export(folder):
         items.append((img, labels))
     if not items:
         raise SystemExit(f"No images under {root / 'images'} - export with 'Save images' ticked.")
-    print(f"Plant 2 export {folder}: {len(items)} images, classes {list(names.values())}")
+    counts = Counter(l[0] for _, ls in items for l in ls)
+    print(f"Plant 2 export {folder}: {len(items)} images, CVAT labels {list(names.values())}")
+    print("  boxes: " + ", ".join(f"{c} {counts[i]}" for i, c in enumerate(CLASSES)))
+    for i, c in enumerate(CLASSES):
+        if c not in names.values():
+            print(f"  WARNING: this export has no '{c}' label at all - its frames would teach the "
+                  f"model that every {c} is background. Re-annotate them or leave this export out.")
+        elif counts[i] == 0:
+            print(f"  WARNING: no '{c}' boxes in this export. Fine only if no {c} is ever visible "
+                  "in these frames; otherwise label them before training.")
     return items, dropped
 
 
@@ -172,6 +189,12 @@ def build_dataset(args):
         items, d = load_cvat_export(f)
         p2 += items
         dropped.update(d)
+    names = Counter(img.name for img, _ in p2)
+    dupes = [n for n, k in names.items() if k > 1]
+    if dupes:
+        raise SystemExit(f"{len(dupes)} image names appear in more than one plant-2 export "
+                         f"(e.g. {dupes[:3]}) - one copy would overwrite the other. Rename the "
+                         "frames in the newer export (or remove frames exported twice) first.")
     p2_train, p2_val = split_by_video(p2, args.val_frac, args.group_regex, args.seed)
     p1 = {"train": [], "val": []}
     if args.plant1:
@@ -230,6 +253,8 @@ def evaluate(best, data_dir, args, name):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--plant2", nargs="+", help="unzipped CVAT Ultralytics YOLO export(s)")
+    ap.add_argument("--classes", nargs="+", default=DEFAULT_CLASSES,
+                    help="classes to train, by name (order = class ids)")
     ap.add_argument("--plant1", default=None, help="plant-1 YOLO dataset (datasets/ppe/yolo)")
     ap.add_argument("--weights", default="yolo26m.pt", help="plant-1 best.pt, or yolo26m.pt")
     ap.add_argument("--out", default="datasets/plant2")
@@ -248,6 +273,7 @@ def main():
     args = ap.parse_args()
 
     from ultralytics import YOLO
+    CLASSES[:] = args.classes
     name = args.name or f"{Path(args.weights).stem}_ft_{args.imgsz}_s{args.seed}"
 
     if args.resume:
