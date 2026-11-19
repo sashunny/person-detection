@@ -1,7 +1,9 @@
 """
 Run the plant-2 model on video(s): show it live in a resizable window and save the output
-video with boxes. Shows only: helmet, no_helmet, boots, no_boots.
-Green = compliant (helmet, boots), red/orange = violation (no_helmet, no_boots).
+video with boxes. Shows: helmet, no_helmet, boots, no_boots and truck.
+Green / teal = compliant (helmet, boots), red / orange = violation (no_helmet, no_boots),
+blue = truck. Works with the older plant-2 model too (it has no truck class: trucks are
+then simply not shown). --hide-truck turns trucks off.
 
 Usage (laptop, CPU)
   pip install -U ultralytics
@@ -34,7 +36,9 @@ SHOW = {
     "head": ("no_helmet", (0, 0, 255)),
     "boots": ("boots", (200, 200, 0)),
     "non_safety_footwear": ("no_boots", (0, 140, 255)),
+    "truck": ("truck", (255, 120, 0)),
 }
+OPTIONAL = {"truck"}                      # shown if the model has it, otherwise skipped
 WINDOW = "PPE test  (q = quit, space = pause)"
 
 
@@ -64,20 +68,20 @@ def fit(w, h, max_w, max_h):
 def draw(frame, dets, info):
     th = max(1, round(frame.shape[0] / 540))
     fs = 0.5 * th
+    # info bar size first, so box labels can avoid it
+    s = 0.65 * th                                       # shrink text to fit the width
+    (tw, _), _ = cv2.getTextSize(info, cv2.FONT_HERSHEY_SIMPLEX, s, th)
+    s *= min(1.0, (frame.shape[1] - 40) / tw)
+    bar = int(40 * s) + 8
     for label, conf, (x1, y1, x2, y2), color in dets:
         p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
         cv2.rectangle(frame, p1, p2, color, th + 1)
         text = f"{label} {conf:.2f}"
         (tw, tht), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
-        y = max(p1[1], tht + 6)
+        y = max(p1[1], bar + tht + 6)                   # never hidden under the info bar
         cv2.rectangle(frame, (p1[0], y - tht - 6), (p1[0] + tw + 4, y), color, -1)
         cv2.putText(frame, text, (p1[0] + 2, y - 4), cv2.FONT_HERSHEY_SIMPLEX, fs,
                     (255, 255, 255), th, cv2.LINE_AA)
-    # info bar
-    s = 0.65 * th                                       # shrink text to fit the width
-    (tw, _), _ = cv2.getTextSize(info, cv2.FONT_HERSHEY_SIMPLEX, s, th)
-    s *= min(1.0, (frame.shape[1] - 40) / tw)
-    bar = int(40 * s) + 8
     cv2.rectangle(frame, (0, 0), (frame.shape[1], bar), (0, 0, 0), -1)
     cv2.putText(frame, info, (10, bar - 10), cv2.FONT_HERSHEY_SIMPLEX, s,
                 (255, 255, 255), th, cv2.LINE_AA)
@@ -85,12 +89,16 @@ def draw(frame, dets, info):
 
 
 def detect(model, frame, keep_ids, args):
-    r = model.predict(frame, conf=args.conf, imgsz=args.imgsz, device="cpu",
-                      classes=keep_ids, verbose=False)[0]
+    r = model.predict(frame, conf=min(args.conf, args.truck_conf), imgsz=args.imgsz,
+                      device="cpu", classes=keep_ids, verbose=False)[0]
     out = []
     for c, s, b in zip(r.boxes.cls.tolist(), r.boxes.conf.tolist(), r.boxes.xyxy.tolist()):
-        label, color = SHOW[model.names[int(c)]]
+        name = model.names[int(c)]
+        if s < (args.truck_conf if name == "truck" else args.conf):
+            continue
+        label, color = SHOW[name]
         out.append((label, s, b, color))
+    out.sort(key=lambda d: d[0] != "truck")      # trucks drawn first, PPE boxes on top
     return out
 
 
@@ -137,7 +145,8 @@ def run_video(model, keep_ids, path, args, show):
             counts = Counter(d[0] for d in dets)
             pct = f"{100 * idx / n:3.0f}%" if n else ""
             info = (f"{pct}  helmet {counts['helmet']}  no_helmet {counts['no_helmet']}  "
-                    f"boots {counts['boots']}  no_boots {counts['no_boots']}   "
+                    f"boots {counts['boots']}  no_boots {counts['no_boots']}  "
+                    + (f"truck {counts['truck']}   " if args.show_truck else "  ") +
                     f"{infer_ms:.0f} ms/inference")
             frame = draw(frame, dets, info)
             writer.write(frame)
@@ -173,6 +182,8 @@ def main():
     ap.add_argument("--conf", type=float, default=0.4)
     ap.add_argument("--imgsz", type=int, default=960, help="same as training")
     ap.add_argument("--fps", type=float, default=4, help="model runs per second of video")
+    ap.add_argument("--truck-conf", type=float, default=0.4, help="confidence for trucks")
+    ap.add_argument("--hide-truck", action="store_true", help="don't draw trucks")
     ap.add_argument("--no-show", action="store_true", help="don't open a window, only save")
     ap.add_argument("--threads", type=int, default=None, help="CPU threads (default: all - 2)")
     args = ap.parse_args()
@@ -185,10 +196,15 @@ def main():
         raise SystemExit(f"No video found at {src}")
 
     model = YOLO(args.weights)
-    missing = [k for k in SHOW if k not in model.names.values()]
+    missing = [k for k in SHOW if k not in model.names.values() and k not in OPTIONAL]
     if missing:
         raise SystemExit(f"Model has no class {missing}. Its classes: {list(model.names.values())}")
-    keep_ids = [i for i, n in model.names.items() if n in SHOW]
+    args.show_truck = "truck" in model.names.values() and not args.hide_truck
+    if "truck" not in model.names.values():
+        print("This model has no 'truck' class - trucks won't be shown.")
+    keep_ids = [i for i, n in model.names.items()
+                if n in SHOW and (n != "truck" or args.show_truck)]
+    print(f"Showing: {[SHOW[model.names[i]][0] for i in keep_ids]}")
 
     show = not args.no_show
     if show and os.name != "nt" and not (os.environ.get("DISPLAY") or
