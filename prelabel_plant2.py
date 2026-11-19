@@ -2,7 +2,9 @@
 Pre-label frames for the new plant with your trained YOLO26 model, for import into CVAT.
 
 Keeps only the classes this plant needs (helmet / no helmet, boots / no boots, plus person,
-which the rules engine needs to tie PPE to a worker). Class names stay the same as plant 1
+which the rules engine needs to tie PPE to a worker, and truck, for the outdoor truck gate and
+the harness on-truck check). Use a detector that has a 'truck' class (e.g. the plant-1 model
+or the new plant-2 model). Class names stay the same as plant 1
 (`head` = no helmet, `non_safety_footwear` = no boots), so the two plants' data can be
 merged into one training set later.
 
@@ -37,6 +39,7 @@ from tqdm import tqdm
 # trained-model class name -> label in the new CVAT project (others are ignored)
 KEEP = {
     "person": "person",
+    "truck": "truck",
     "helmet": "helmet",
     "head": "head",                                # no helmet
     "boots": "boots",
@@ -44,11 +47,11 @@ KEEP = {
 }
 # Labels for the CVAT project, in this order. "harness" is included now so it's ready when
 # you have harness data (the model gives no harness boxes; just leave it unused for now).
-CVAT_LABELS = ["person", "helmet", "head", "boots", "non_safety_footwear", "harness"]
+CVAT_LABELS = ["person", "truck", "helmet", "head", "boots", "non_safety_footwear", "harness"]
 
 # Confidence thresholds. A new plant looks different from the training data, so the model
 # is less confident there; these are a little lower than you'd use in production.
-CONF = {"person": 0.4, "helmet": 0.35, "head": 0.35, "boots": 0.3, "non_safety_footwear": 0.3}
+CONF = {"person": 0.4, "truck": 0.4, "helmet": 0.35, "head": 0.35, "boots": 0.3, "non_safety_footwear": 0.3}
 
 # Classes that can't be on the same object: if their boxes overlap above this IoU,
 # keep only the more confident one (helmet vs head on one head, boots vs shoes on one foot).
